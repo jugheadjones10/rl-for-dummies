@@ -183,10 +183,28 @@ if __name__ == "__main__":
             get_network = get_network_fn
             break
 
-    if get_network is not None and args.network is not None:
-        Network = get_network(args.network)
-    else:
-        Network = PolicyNetwork
+    if args.network is not None:
+        # Network name will be in the form experiment-<experiment-name>-<network-name>
+        if args.network.startswith("experiment-"):
+            experiment_name, network_name = args.network[11:].split("-")
+            try:
+                # Import the get_network function from the experimental folder
+                module_name = f"experiments.{experiment_name}.networks"
+                network_module = __import__(module_name, fromlist=["get_network"])
+                Network = network_module.get_network(network_name)
+            except ImportError:
+                raise ImportError(
+                    f"Could not find experimental networks module: {module_name}"
+                )
+            except AttributeError:
+                raise AttributeError(
+                    f"Network '{network_name}' not found in experimental networks"
+                )
+        elif get_network is not None:
+            # Use environment-specific network getter
+            Network = get_network(args.network)
+        else:
+            Network = PolicyNetwork
 
     # TRY NOT TO MODIFY: seeding for reproducibility
     random.seed(args.seed)
@@ -219,11 +237,15 @@ if __name__ == "__main__":
 
     # Initialize the policy network and create a TrainState
     policy = Network(action_dim=envs.single_action_space.n)
+    # How to print number of parameters in the network?
     state = TrainState.create(
         apply_fn=policy.apply,
         params=policy.init(init_key, obs),
         tx=optax.adam(learning_rate=args.learning_rate),
     )
+
+    param_count = sum(x.size for x in jax.tree_util.tree_leaves(state.params))
+    print(f"Number of parameters in the network: {param_count}")
 
     # Optionally, you can jax.jit the apply_fn (this is safe because it's a pure function)
     policy.apply = jax.jit(policy.apply)

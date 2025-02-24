@@ -24,8 +24,8 @@ tasks:
       - |
         python -m rl_for_dummies.reinforce_jax \
         --env-id "FrozenLake-v1" \
-        --total-timesteps 25000 \
-        --network "deep" \
+        --total-timesteps 15000 \
+        --network "experiment-frozen_lake_shallow-Shallow2" \
         --env-kwargs '{"is_slippery": false}'
 
   train_one:

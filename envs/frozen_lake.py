@@ -42,9 +42,9 @@ class DeepPolicyNetwork(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray):
-        x = nn.Dense(16)(x)
+        x = nn.Dense(45)(x)
         x = nn.relu(x)
-        x = nn.Dense(8)(x)
+        x = nn.Dense(45)(x)
         x = nn.relu(x)
         logits = nn.Dense(self.action_dim)(x)
         return logits

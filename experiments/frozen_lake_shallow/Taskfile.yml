@@ -1,0 +1,34 @@
+version: "3"
+
+vars:
+  networks:
+    - Shallow1
+    - Shallow2
+    - Shallow3
+    - Deep1
+    - Deep2
+    - Deep3
+
+tasks:
+  train:
+    desc: Train a specific network
+    cmds:
+      - |
+        python -m rl_for_dummies.reinforce_jax \
+        --env-id "FrozenLake-v1" \
+        --total-timesteps 15000 \
+        --network "experiment-frozen_lake_shallow-{{.CLI_ARGS}}" \
+        --exp-name "{{.CLI_ARGS}}" \
+        --env-kwargs '{"is_slippery": false}'
+
+  train_all:
+    desc: Train all networks in sequence
+    cmds:
+      - for: { var: networks }
+        cmd: |
+          python -m rl_for_dummies.reinforce_jax \
+          --env-id "FrozenLake-v1" \
+          --total-timesteps 15000 \
+          --network "experiment-frozen_lake_shallow-{{.ITEM}}" \
+          --exp-name "{{.ITEM}}" \
+          --env-kwargs '{"is_slippery": false}'
