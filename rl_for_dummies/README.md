@@ -10,9 +10,13 @@ Port of `reinforce_frozen_lake.py` to Jax.
 
 Implementation of REINFORCE in Jax in the style of CleanRL.
 
-#### dqn_jax_simple_frozen_lake.py
+#### dqn_simple_jax_frozen_lake.py
 
-#### dqn_jax_simple_cleanrl.py
+Simple DQN implementation (no replay buffer, no target network, etc.) for FrozenLake environment, in Jax.
+
+#### dqn_simple_jax.py
+
+Simple DQN implementation in Jax in the style of CleanRL.
 
 #### dqn_jax.py
 
