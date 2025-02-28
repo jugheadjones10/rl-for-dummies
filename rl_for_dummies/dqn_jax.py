@@ -297,6 +297,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
+    autoreset = np.zeros(envs.num_envs)
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         epsilon = linear_schedule(
@@ -336,7 +337,17 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
         # Read "Vector Environments" section in https://gymnasium.farama.org/gymnasium_release_notes/
         # on why we don't need to handle final_observation like the above anymore.
-        rb.add(obs, next_obs, actions, rewards, terminations, infos)
+        # TODO Need to test if the below actually works
+        if np.any(~autoreset):  # Only add if there's at least one non-autoreset env
+            rb.add(
+                obs[~autoreset],
+                next_obs[~autoreset],
+                actions[~autoreset],
+                rewards[~autoreset],
+                terminations[~autoreset],
+                infos[~autoreset],
+            )
+        autoreset = np.logical_or(terminations, truncations)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
