@@ -1,4 +1,4 @@
-from typing import Dict, Type
+from typing import Type
 
 import flax.linen as nn
 import gymnasium as gym
@@ -50,16 +50,9 @@ class DeepPolicyNetwork(nn.Module):
         return logits
 
 
-# Dictionary mapping network names to their classes
-NETWORKS: Dict[str, Type[nn.Module]] = {
-    "simple": SimplePolicyNetwork,
-    "deep": DeepPolicyNetwork,
-}
-
-
 def get_network(network_name: str) -> Type[nn.Module]:
-    if network_name not in NETWORKS:
+    if network_name not in globals():
         raise ValueError(
-            f"Unknown network: {network_name}. Available networks: {list(NETWORKS.keys())}"
+            f"Unknown network: {network_name}. Available networks: {[n for n in globals() if isinstance(globals()[n], type) and issubclass(globals()[n], nn.Module)]}"
         )
-    return NETWORKS[network_name]
+    return globals()[network_name]

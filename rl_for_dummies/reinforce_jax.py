@@ -177,6 +177,8 @@ if __name__ == "__main__":
         + "\n".join([f"|{key}|{value}|" for key, value in vars(args).items()]),
     )
 
+    get_network = None
+    env_maker = None
     for key, (env_make_fn, get_network_fn) in SPECIAL_ENVS.items():
         if args.env_id.startswith(key):
             env_maker = env_make_fn
@@ -203,8 +205,8 @@ if __name__ == "__main__":
         elif get_network is not None:
             # Use environment-specific network getter
             Network = get_network(args.network)
-        else:
-            Network = PolicyNetwork
+    else:
+        Network = PolicyNetwork
 
     # TRY NOT TO MODIFY: seeding for reproducibility
     random.seed(args.seed)

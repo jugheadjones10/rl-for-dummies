@@ -56,8 +56,8 @@ def main():
     env = OneHotWrapper(env)
     pi = Policy(action_dim=env.action_space.n)
 
-    obs, _ = env.reset()
-    params = pi.init(init_key, obs)
+    s, _ = env.reset()
+    params = pi.init(init_key, s)
     optimizer = optax.adam(learning_rate=learning_rate)
     opt_state = optimizer.init(params)
 

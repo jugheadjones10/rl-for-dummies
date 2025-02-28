@@ -1,4 +1,7 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/dqn/#dqn_jaxpy
+import os
+
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
+
 import json
 import os
 import random
@@ -7,7 +10,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 import flax
+import flax.core
 import flax.linen as nn
+import flax.serialization
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
@@ -16,15 +21,15 @@ import optax
 import tyro
 from flax.training.train_state import TrainState
 from stable_baselines3.common.buffers import ReplayBuffer
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
 
 # Import special environment functions and their networks:
-from train.envs.frozen_lake import FrozenLakeQNetwork, frozen_lake_make_env
+from envs.frozen_lake import frozen_lake_make_env
+from envs.frozen_lake import get_network as get_frozen_lake_network
 
 # - if a network for FrozenLake is defined, import it here:
 # from .envs.frozen_lake import FrozenLakeQNetwork
-from train.envs.minigrid import MiniGridQNetwork, minigrid_make_env
-from train.envs.pushworld import PushWorldQNetwork, pushworld_make_env
+from envs.minigrid import minigrid_make_env
 
 print("JAX devices: ", jax.devices())
 print("Default device: ", jax.default_device())
@@ -56,6 +61,8 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "CartPole-v1"
     """the id of the environment"""
+    network: Optional[str] = None
+    """Type of network to use"""
     total_timesteps: int = 500000
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
@@ -86,26 +93,31 @@ class Args:
 
 # Mapping of env-name prefixes to their special env creators and network definitions.
 SPECIAL_ENVS = {
-    "FrozenLake": (frozen_lake_make_env, FrozenLakeQNetwork),
-    "MiniGrid": (minigrid_make_env, MiniGridQNetwork),
-    "PushWorld": (pushworld_make_env, PushWorldQNetwork),
+    "FrozenLake": (frozen_lake_make_env, get_frozen_lake_network),
+    "MiniGrid": (minigrid_make_env, None),
+    # "PushWorld": (pushworld_make_env, None),
 }
 
 
 def make_env(
-    env_id, seed, idx, capture_video, run_name, render_mode=None, **env_kwargs
+    env_id,
+    env_maker,
+    seed,
+    idx,
+    capture_video,
+    run_name,
+    render_mode=None,
+    **env_kwargs,
 ):
     def thunk():
         # Choose render mode: force "rgb_array" if recording
         use_render_mode = "rgb_array" if (capture_video and idx == 0) else render_mode
 
         # Create environment via SPECIAL_ENVS mapping or via gym.make
-        for key, (make_fn, _) in SPECIAL_ENVS.items():
-            if env_id.startswith(key):
-                env = make_fn(env_id, use_render_mode, **env_kwargs)
-                break
-        else:
+        if env_maker is None:
             env = gym.make(env_id, render_mode=use_render_mode, **env_kwargs)
+        else:
+            env = env_maker(env_id, use_render_mode, **env_kwargs)
 
         # Wrap in RecordVideo only if we're capturing video
         if capture_video and idx == 0:
@@ -121,27 +133,17 @@ def make_env(
     return thunk
 
 
-# Here we choose the appropriate network based on env_id.
-def get_network(env_id, action_dim):
-    for key, (_, net_cls) in SPECIAL_ENVS.items():
-        if env_id.startswith(key) and net_cls is not None:
-            return net_cls(action_dim=action_dim)
+class QNetwork(nn.Module):
+    action_dim: int
 
-    # Fallback generic network:
-    # This is a simple baseline network definition:
-    class QNetwork(nn.Module):
-        action_dim: int
-
-        @nn.compact
-        def __call__(self, x: jnp.ndarray):
-            x = nn.Dense(120)(x)
-            x = nn.relu(x)
-            x = nn.Dense(84)(x)
-            x = nn.relu(x)
-            x = nn.Dense(self.action_dim)(x)
-            return x
-
-    return QNetwork(action_dim=action_dim)
+    @nn.compact
+    def __call__(self, x: jnp.ndarray):
+        x = nn.Dense(120)(x)
+        x = nn.relu(x)
+        x = nn.Dense(84)(x)
+        x = nn.relu(x)
+        x = nn.Dense(self.action_dim)(x)
+        return x
 
 
 class TrainState(TrainState):
@@ -190,6 +192,37 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
+    get_network = None
+    env_maker = None
+    for key, (env_make_fn, get_network_fn) in SPECIAL_ENVS.items():
+        if args.env_id.startswith(key):
+            env_maker = env_make_fn
+            get_network = get_network_fn
+            break
+
+    if args.network is not None:
+        # Network name will be in the form experiment-<experiment-name>-<network-name>
+        if args.network.startswith("experiment-"):
+            experiment_name, network_name = args.network[11:].split("-")
+            try:
+                # Import the get_network function from the experimental folder
+                module_name = f"experiments.{experiment_name}.networks"
+                network_module = __import__(module_name, fromlist=["get_network"])
+                Network = network_module.get_network(network_name)
+            except ImportError:
+                raise ImportError(
+                    f"Could not find experimental networks module: {module_name}"
+                )
+            except AttributeError:
+                raise AttributeError(
+                    f"Network '{network_name}' not found in experimental networks"
+                )
+        elif get_network_fn is not None:
+            # Use environment-specific network getter
+            Network = get_network_fn(args.network)
+    else:
+        Network = QNetwork
+
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -201,11 +234,12 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         [
             make_env(
                 args.env_id,
+                env_maker,
                 args.seed + i,
                 i,
                 args.capture_video,
                 run_name,
-                **args.env_kwargs,
+                **env_kwargs,
             )
             for i in range(args.num_envs)
         ]
@@ -216,7 +250,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     ), "only discrete action space is supported"
 
     obs, _ = envs.reset(seed=args.seed)
-    q_network = get_network(args.env_id, envs.single_action_space.n)
+    q_network = Network(action_dim=envs.single_action_space.n)
     q_state = TrainState.create(
         apply_fn=q_network.apply,
         params=q_network.init(q_key, obs),
