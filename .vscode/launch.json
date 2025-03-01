@@ -1,0 +1,26 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: REINFORCE (FrozenLake)",
+      "type": "python",
+      "request": "launch",
+      "module": "rl_for_dummies.dqn_jax_simple_cleanrl",
+      "args": ["--env-kwargs", "{\"is_slippery\": false}"],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Python: REINFORCE (FrozenLake) dwarf",
+      "type": "python",
+      "request": "launch",
+      "module": "rl_for_dummies.dqn_jax_simple_cleanrl_dwarf",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "console": "integratedTerminal"
+    }
+  ]
+}

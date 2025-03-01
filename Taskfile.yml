@@ -1,41 +1,39 @@
 version: "3"
 tasks:
   train:
-    desc: Train PushWorld with DQN (hyperparameter-tuned)
+    desc: Train FrozenLake with DQN (hyperparameter-tuned)
     cmds:
-      - python -m rl_for_dummies.dqn_jax
-        --env-id "FrozenLake-v1"
-        --learning-rate 0.0005
-        --buffer-size 100
-        --gamma 0.99
-        --tau 0.92
-        --target-network-frequency 4000
-        --batch-size 128
-        --start-e 0.5
-        --end-e 0.01
-        --exploration-fraction 0.2
-        --learning-starts 0
-        --train-frequency 10
-        # --env-kwargs is_slippery False
+      - |
+        python -m rl_for_dummies.dqn_jax \
+        --env-id "FrozenLake-v1" \
+        --learning-rate 0.0005 \
+        --buffer-size 100 \
+        --gamma 0.99 \
+        --tau 0.92 \
+        --target-network-frequency 4000 \
+        --batch-size 128 \
+        --start-e 0.5 \
+        --end-e 0.01 \
+        --exploration-fraction 0.2 \
+        --learning-starts 0 \
+        --train-frequency 10 \
+        --env-kwargs '{"is_slippery": false}'
 
   train_reinforce:
-    desc: Train PushWorld with REINFORCE
+    desc: Train FrozenLake with REINFORCE (simple)
     cmds:
       - |
         python -m rl_for_dummies.reinforce_jax \
         --env-id "FrozenLake-v1" \
         --total-timesteps 15000 \
-        --network "experiment-frozen_lake_shallow-Shallow2" \
         --env-kwargs '{"is_slippery": false}'
 
-  train_one:
-    desc: Train OneStepRewardEnv with REINFORCE
+  train_dqn_simple:
+    desc: Train FrozenLake with DQN (simple)
     cmds:
-      - python -m rl_for_dummies.reinforce_jax
-        --env-id "One"
-
-  train_shortcorridor:
-    desc: Train ShortCorridorEnv with REINFORCE
-    cmds:
-      - python -m rl_for_dummies.reinforce_jax
-        --env-id "ShortCorridor"
+      - |
+        python -m rl_for_dummies.dqn_simple_jax \
+        --env-id "FrozenLake-v1" \
+        --exploration-fraction 0.1 \
+        --total-timesteps 15000 \
+        --env-kwargs '{"is_slippery": false}'

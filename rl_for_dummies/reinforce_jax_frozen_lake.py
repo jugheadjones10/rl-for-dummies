@@ -106,10 +106,6 @@ def main():
 
         time_taken += time.time() - start_time
 
-        if score / print_interval == 0.95:
-            print(f"It took {n_epi} episodes to reach 95% of the max score")
-            break
-
         if n_epi % print_interval == 0 and n_epi != 0:
             print(
                 f"# of episode :{n_epi}, avg score : {score / print_interval}, avg episode time: {time_taken / print_interval:.4f} sec"
