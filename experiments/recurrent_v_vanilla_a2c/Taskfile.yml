@@ -1,0 +1,40 @@
+version: "3"
+
+tasks:
+  train_recurrent:
+    desc: Train recurrent a2c
+    cmds:
+      - |
+        python -m rl_for_dummies.a2c_recurrent_minigrid_parameterised \
+          --env_id MiniGrid-Empty-5x5-v0 \
+          --seed 40 \
+          --max_train_steps 15000
+
+  train_vanilla:
+    desc: Train vanilla a2c
+    cmds:
+      - |
+        python -m rl_for_dummies.a2c_minigrid_parameterised \
+          --env_id MiniGrid-Empty-5x5-v0 \
+          --seed 40 \
+          --max_train_steps 15000
+
+  train_recurrent_seeds:
+    desc: Train recurrent a2c with different seeds
+    cmds:
+      - for: ["40", "41", "42", "43", "44"]
+        cmd: |
+          python -m rl_for_dummies.a2c_recurrent_minigrid_parameterised \
+            --env_id MiniGrid-Empty-Random-6x6-v0 \
+            --seed {{.ITEM}} \
+            --max_train_steps 25000
+
+  train_vanilla_seeds:
+    desc: Train vanilla a2c with different seeds
+    cmds:
+      - for: ["40", "41", "42", "43", "44"]
+        cmd: |
+          python -m rl_for_dummies.a2c_minigrid_parameterised \
+            --env_id MiniGrid-Empty-Random-6x6-v0 \
+            --seed {{.ITEM}} \
+            --max_train_steps 25000
