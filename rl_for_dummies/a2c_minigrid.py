@@ -1,6 +1,7 @@
 import random
 
 import gymnasium as gym
+import matplotlib.pyplot as plt
 import minigrid  # noqa
 import numpy as np
 import torch
@@ -12,14 +13,15 @@ from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper  # noqa
 from torch.distributions import Categorical
 
 # Hyperparameters
-n_train_processes = 3
+n_train_processes = 4
 learning_rate = 0.0002
-update_interval = 20
+update_interval = 10
 gamma = 0.98
 max_train_steps = 10**7
-entropy_coef = 0.01
-PRINT_INTERVAL = update_interval * 100
+entropy_coef = 0.1
 
+MINIGRID_ENV = "MiniGrid-Empty-8x8-v0"
+PRINT_INTERVAL = update_interval * 10
 SEED = 42
 
 
@@ -29,8 +31,8 @@ class ActorCritic(nn.Module):
         # CNN layers
         self.conv1 = nn.Conv2d(3, 16, kernel_size=2, stride=1)
 
-        # Calculate output size after convolution: 5-2+1 = 4
-        conv_output_size = 4 * 4 * 16
+        # Calculate output size after convolution:
+        conv_output_size = 6 * 6 * 16
 
         # Fully connected layers
         self.fc1 = nn.Linear(conv_output_size, 64)
@@ -39,8 +41,6 @@ class ActorCritic(nn.Module):
 
     def forward(self, x):
         """Common forward pass for both policy and value networks"""
-        # Normalize input
-        x = x / 255.0
 
         # Handle different input formats
         if len(x.shape) == 3:  # Single observation [H,W,C]
@@ -73,8 +73,8 @@ class ActorCritic(nn.Module):
 
 def worker(worker_id, master_end, worker_end):
     master_end.close()  # Forbid worker to use the master end for messaging
-    env = gym.make("MiniGrid-DoorKey-5x5-v0")
-    env = FullyObsWrapper(env)
+    env = gym.make(MINIGRID_ENV)
+    # env = FullyObsWrapper(env)
     env = ImgObsWrapper(env)
     env.action_space.seed(SEED)
 
@@ -153,13 +153,13 @@ class ParallelEnv:
 
 
 def test(step_idx, model):
-    env = gym.make("MiniGrid-DoorKey-5x5-v0")
-    env = FullyObsWrapper(env)
+    env = gym.make(MINIGRID_ENV)
+    # env = FullyObsWrapper(env)
     env = ImgObsWrapper(env)
+    env.action_space.seed(SEED)
     score = 0.0
     done = False
-    num_test = 10
-
+    num_test = 5
     for _ in range(num_test):
         s, _ = env.reset()
         while not done:
@@ -173,6 +173,7 @@ def test(step_idx, model):
     print(f"Step # :{step_idx}, avg score : {score/num_test:.1f}")
 
     env.close()
+    return score / num_test
 
 
 def compute_target(v_final, r_lst, mask_lst):
@@ -202,6 +203,7 @@ if __name__ == "__main__":
 
     step_idx = 0
     s = envs.reset()
+    ep_returns = []
     while step_idx < max_train_steps:
         s_lst, a_lst, r_lst, mask_lst = list(), list(), list(), list()
         for _ in range(update_interval):
@@ -244,6 +246,12 @@ if __name__ == "__main__":
         optimizer.step()
 
         if step_idx % PRINT_INTERVAL == 0:
-            test(step_idx, model)
+            avg_score = test(step_idx, model)
+            ep_returns.append(avg_score)
+            if avg_score >= 0.9:
+                print(f"Step #{step_idx} finished with avg score {avg_score}")
+                break
 
     envs.close()
+    plt.plot(ep_returns)
+    plt.show()
