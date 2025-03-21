@@ -128,7 +128,7 @@ def worker(worker_id, master_end, worker_end, config):
             ob, reward, terminated, truncated, info = env.step(data)
             done = terminated or truncated
             if done:
-                ob, _ = env.reset(seed=config.seed + worker_id)
+                ob, _ = env.reset()
             worker_end.send((ob, reward, done, info))
         elif cmd == "reset":
             ob, _ = env.reset(seed=config.seed + worker_id)
@@ -205,8 +205,8 @@ def test(step_idx, model, config):
     score = 0.0
     done = False
     num_test = 5
-    for ep in range(num_test):
-        s, _ = env.reset(seed=config.seed + ep)
+    for _ in range(num_test):
+        s, _ = env.reset()
         initial_state = torch.zeros(2 * 64, dtype=torch.float)
         h_in = initial_state
         while not done:

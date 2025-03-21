@@ -111,7 +111,7 @@ def worker(worker_id, master_end, worker_end, config):
             ob, reward, terminated, truncated, info = env.step(data)
             done = terminated or truncated
             if done:
-                ob, _ = env.reset(seed=config.seed + worker_id)
+                ob, _ = env.reset()
             worker_end.send((ob, reward, done, info))
         elif cmd == "reset":
             ob, _ = env.reset(seed=config.seed + worker_id)
@@ -188,9 +188,8 @@ def test(step_idx, model, config):
     score = 0.0
     done = False
     num_test = 5
-    for ep in range(num_test):
-        s, _ = env.reset(seed=config.seed + ep)
-
+    for _ in range(num_test):
+        s, _ = env.reset()
         while not done:
             prob = model.pi(torch.from_numpy(s).float())
             a = Categorical(prob).sample().item()
@@ -308,11 +307,3 @@ if __name__ == "__main__":
 
     # Run training
     results = train(config)
-
-    # Show final plot (will be saved as well)
-    # plt.figure(figsize=(10, 6))
-    # plt.plot(results)
-    # plt.title(f"Training Results - {config.experiment_name}")
-    # plt.xlabel("Evaluation")
-    # plt.ylabel("Average Return")
-    # plt.show()
