@@ -1,8 +1,8 @@
 import os
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import gymnasium as gym
 import minigrid  # noqa
@@ -13,8 +13,95 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import tyro
-from minigrid.wrappers import ImgObsWrapper  # noqa
+from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper  # noqa
 from torch.distributions import Categorical
+
+
+# Add a wrapper that restricts the action space to only the used actions (Actions 0, 1, 2)
+class RestrictedActionWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.action_space = gym.spaces.Discrete(3)
+
+
+class TwoChannelWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+
+    def reset(self, **kwargs):
+        """Reset the environment and return custom observation"""
+        obs, info = self.env.reset(**kwargs)
+        return self._get_observation(obs), info
+
+    def step(self, action):
+        """Take a step and return custom observation"""
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return self._get_observation(obs), reward, terminated, truncated, info
+
+    def _get_observation(self, obs):
+        """Convert Minigrid observation to custom format
+        We return 2 channels.
+        First channel is similar to the OBJECT_IDX channel in original Minigrid,
+        except we only have 4 possible values (0, 1, 2, 3) instead of 11.
+        Second channel encodes the direction of the agent.
+        """
+        # Initialize empty 5x5 grid
+        grid = np.zeros((2, 5, 5), dtype=np.uint8)
+
+        obs = obs.transpose(2, 0, 1)
+        object_idx = obs[0]
+
+        wall_pos = np.where(object_idx == 2)
+        grid[0][wall_pos[0], wall_pos[1]] = 3
+
+        agent_pos = np.where(object_idx == 10)
+        grid[0][agent_pos[0], agent_pos[1]] = 1
+
+        goal_pos = np.where(object_idx == 8)
+        grid[0][goal_pos[0], goal_pos[1]] = 2
+
+        # Second grid channel is for direction
+        grid[1][agent_pos[0], agent_pos[1]] = self.unwrapped.agent_dir + 1
+
+        # Return dictionary with grid and direction
+        return grid.transpose(1, 2, 0)
+
+
+# Gym wrapper that removes the color channel and state channel
+class OneChannelWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        return self._get_observation(obs), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return self._get_observation(obs), reward, terminated, truncated, info
+
+    def _get_observation(self, obs):
+        # Only return the OBJECT_IDX channel
+        return np.expand_dims(obs[:, :, 0], axis=-1)
+
+
+WRAPPER_REGISTRY = {
+    "img_obs": ImgObsWrapper,
+    "fully_obs": FullyObsWrapper,
+    "one_channel": OneChannelWrapper,
+    "two_channel": TwoChannelWrapper,
+    "restricted_actions": RestrictedActionWrapper,
+}
+
+
+def make_env(config):
+    env = gym.make(config.env_id)
+
+    for w_name in config.wrapper_names:
+        wrapper_cls = WRAPPER_REGISTRY[w_name]
+        env = wrapper_cls(env)
+
+    return env
 
 
 @dataclass
@@ -23,6 +110,7 @@ class TrainingConfig:
 
     # Environment settings
     env_id: str = "MiniGrid-Empty-5x5-v0"
+    wrapper_names: List[str] = field(default_factory=list)
 
     # Training hyperparameters
     n_train_processes: int = 4
@@ -36,6 +124,11 @@ class TrainingConfig:
     output_dir: Path = Path("./results")
     experiment_name: Optional[str] = None
     print_interval: int = 100
+
+    # Network architecture
+    conv_input_channels: int = 3
+    env_size: int = 5
+    action_space_size: int = 7
 
     # Reproducibility
     seed: int = 42
@@ -54,17 +147,17 @@ class TrainingConfig:
 
 
 class ActorCritic(nn.Module):
-    def __init__(self):
+    def __init__(self, config):
         super(ActorCritic, self).__init__()
         # CNN layers
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=2, stride=1)
+        self.conv1 = nn.Conv2d(config.conv_input_channels, 16, kernel_size=2, stride=1)
 
         # Calculate output size after convolution:
-        conv_output_size = 6 * 6 * 16
+        conv_output_size = (config.env_size - 1) * (config.env_size - 1) * 16
 
         # Fully connected layers
         self.fc1 = nn.Linear(conv_output_size, 64)
-        self.fc_pi = nn.Linear(64, 7)  # 7 actions for MiniGrid
+        self.fc_pi = nn.Linear(64, config.action_space_size)  # 7 actions for MiniGrid
         self.fc_v = nn.Linear(64, 1)
 
     def forward(self, x):
@@ -101,8 +194,7 @@ class ActorCritic(nn.Module):
 
 def worker(worker_id, master_end, worker_end, config):
     master_end.close()  # Forbid worker to use the master end for messaging
-    env = gym.make(config.env_id)
-    env = ImgObsWrapper(env)
+    env = make_env(config)
     env.action_space.seed(config.seed + worker_id)
 
     while True:
@@ -182,8 +274,7 @@ class ParallelEnv:
 
 
 def test(step_idx, model, config):
-    env = gym.make(config.env_id)
-    env = ImgObsWrapper(env)
+    env = make_env(config)
     env.action_space.seed(config.seed)
     score = 0.0
     done = False
@@ -197,7 +288,6 @@ def test(step_idx, model, config):
             done = terminated or truncated
             s = s_prime
             score += r
-
         done = False
 
     avg_score = round(score / num_test, 2)
@@ -224,11 +314,9 @@ def train(config):
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     torch.cuda.manual_seed_all(config.seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
     envs = ParallelEnv(config)
-    model = ActorCritic()
+    model = ActorCritic(config)
     optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
 
     # Start training
@@ -281,9 +369,6 @@ def train(config):
             avg_score = test(step_idx, model, config)
             ep_returns.append(avg_score)
             write_result(step_idx, avg_score, config)
-            # if avg_score >= 0.85:
-            #     print(f"Step #{step_idx} finished with avg score {avg_score}")
-            #     break
 
     envs.close()
     return ep_returns

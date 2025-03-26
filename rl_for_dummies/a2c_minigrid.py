@@ -20,23 +20,100 @@ gamma = 0.98
 max_train_steps = 10**7
 entropy_coef = 0.1
 
-MINIGRID_ENV = "MiniGrid-Empty-8x8-v0"
+MINIGRID_ENV = "MiniGrid-Empty-5x5-v0"
 PRINT_INTERVAL = update_interval * 10
 SEED = 42
+
+
+# Add a wrapper that restricts the action space to only the used actions (Actions 0, 1, 2)
+class RestrictedActionWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.action_space = gym.spaces.Discrete(3)
+
+
+class SimplifiedStateWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+
+    def reset(self, **kwargs):
+        """Reset the environment and return custom observation"""
+        obs, info = self.env.reset(**kwargs)
+        return self._get_observation(obs), info
+
+    def step(self, action):
+        """Take a step and return custom observation"""
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return self._get_observation(obs), reward, terminated, truncated, info
+
+    def _get_observation(self, obs):
+        """Convert Minigrid observation to custom format"""
+        # Initialize empty 5x5 grid
+        grid = np.zeros((2, 5, 5), dtype=np.uint8)
+
+        obs = obs.transpose(2, 0, 1)
+        object_idx = obs[0]
+
+        wall_pos = np.where(object_idx == 2)
+        grid[0][wall_pos[0], wall_pos[1]] = 3
+
+        agent_pos = np.where(object_idx == 10)
+        grid[0][agent_pos[0], agent_pos[1]] = 1
+
+        goal_pos = np.where(object_idx == 8)
+        grid[0][goal_pos[0], goal_pos[1]] = 2
+
+        # Second grid channel is for direction
+        grid[1][agent_pos[0], agent_pos[1]] = self.unwrapped.agent_dir + 1
+
+        # Return dictionary with grid and direction
+        return grid.transpose(1, 2, 0)
+
+
+# Gym wrapper that removes the color channel and state channel
+class SimplifiedObsWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        # self.observation_space = gym.spaces.Box(
+        #     low=0, high=10, shape=(5, 5, 1), dtype=np.uint8
+        # )
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        return self._get_observation(obs), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return self._get_observation(obs), reward, terminated, truncated, info
+
+    def _get_observation(self, obs):
+        return np.expand_dims(obs[:, :, 0], axis=-1)
+
+
+def get_initial_state():
+    env = gym.make(MINIGRID_ENV)
+    env = FullyObsWrapper(env)
+    env = ImgObsWrapper(env)
+    env = RestrictedActionWrapper(env)
+    # env = SimplifiedObsWrapper(env)
+    env = SimplifiedStateWrapper(env)
+    s, _ = env.reset()
+    env.close()
+    return s
 
 
 class ActorCritic(nn.Module):
     def __init__(self):
         super(ActorCritic, self).__init__()
         # CNN layers
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=2, stride=1)
+        self.conv1 = nn.Conv2d(2, 8, kernel_size=2, stride=1)
 
         # Calculate output size after convolution:
-        conv_output_size = 6 * 6 * 16
+        conv_output_size = 4 * 4 * 8
 
         # Fully connected layers
         self.fc1 = nn.Linear(conv_output_size, 64)
-        self.fc_pi = nn.Linear(64, 7)  # 7 actions for MiniGrid
+        self.fc_pi = nn.Linear(64, 3)  # 3 actions for MiniGrid
         self.fc_v = nn.Linear(64, 1)
 
     def forward(self, x):
@@ -74,9 +151,12 @@ class ActorCritic(nn.Module):
 def worker(worker_id, master_end, worker_end):
     master_end.close()  # Forbid worker to use the master end for messaging
     env = gym.make(MINIGRID_ENV)
-    # env = FullyObsWrapper(env)
+    env = FullyObsWrapper(env)
     env = ImgObsWrapper(env)
-    env.action_space.seed(SEED)
+    env = RestrictedActionWrapper(env)
+    env = SimplifiedStateWrapper(env)
+    # env = SimplifiedObsWrapper(env)
+    env.action_space.seed(SEED + worker_id)
 
     while True:
         cmd, data = worker_end.recv()
@@ -152,10 +232,62 @@ class ParallelEnv:
             self.closed = True
 
 
+def visualize_action_probs(model, get_initial_state):
+    # Create a copy of your initial state
+    s_ = get_initial_state().copy()
+    s_[1, 1, 0] = 1  # Put agent at (1,1) initially (just as your snippet does)
+
+    fig, axes = plt.subplots(5, 5, figsize=(8, 8))
+    fig.suptitle("Action Probability Distribution for Each Cell")
+
+    # Loop through the 5×5 grid
+    for i in range(5):
+        for j in range(5):
+            # Place the agent temporarily at (i,j)
+            s_[i, j, 0] = 10
+
+            # Compute action probabilities
+            with torch.no_grad():  # Turn off grad to speed up
+                prob_ = model.pi(torch.from_numpy(s_).float())
+            prob_values = prob_.numpy().flatten()
+
+            # Revert (i, j) position so it doesn't affect next cell
+            s_[i, j, 0] = 1
+
+            ax = axes[i, j]
+
+            actions = ["Left", "Right", "Forward"]
+            base_fontsize = 8
+            scale = 10
+
+            for a_idx, action_name in enumerate(actions):
+                p = prob_values[a_idx]
+                fontsize = base_fontsize + p**4 * scale
+                y_offset = 0.75 - 0.25 * a_idx
+                ax.text(
+                    0.5,
+                    y_offset,
+                    f"{action_name}: {p:.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=fontsize,
+                    transform=ax.transAxes,
+                )
+
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+    plt.tight_layout()
+    plt.show()
+
+
 def test(step_idx, model):
     env = gym.make(MINIGRID_ENV)
-    # env = FullyObsWrapper(env)
+    env = FullyObsWrapper(env)
     env = ImgObsWrapper(env)
+    env = RestrictedActionWrapper(env)
+    env = SimplifiedStateWrapper(env)
+    # env = SimplifiedObsWrapper(env)
     env.action_space.seed(SEED)
     score = 0.0
     done = False
@@ -170,10 +302,12 @@ def test(step_idx, model):
             s = s_prime
             score += r
         done = False
-    print(f"Step # :{step_idx}, avg score : {score/num_test:.1f}")
+
+    avg_score = round(score / num_test, 2)
+    print(f"Step # :{step_idx}, avg score : {avg_score}")
 
     env.close()
-    return score / num_test
+    return avg_score
 
 
 def compute_target(v_final, r_lst, mask_lst):
@@ -193,18 +327,16 @@ if __name__ == "__main__":
     np.random.seed(SEED)
     torch.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
     envs = ParallelEnv(n_train_processes)
-
     model = ActorCritic()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
     step_idx = 0
     s = envs.reset()
     ep_returns = []
-    while step_idx < max_train_steps:
+
+    while step_idx < 30000:
         s_lst, a_lst, r_lst, mask_lst = list(), list(), list(), list()
         for _ in range(update_interval):
             prob = model.pi(torch.from_numpy(s).float())
@@ -248,10 +380,21 @@ if __name__ == "__main__":
         if step_idx % PRINT_INTERVAL == 0:
             avg_score = test(step_idx, model)
             ep_returns.append(avg_score)
-            if avg_score >= 0.9:
-                print(f"Step #{step_idx} finished with avg score {avg_score}")
-                break
 
-    envs.close()
+        if step_idx % 10000 == 0:
+            # Visualise the policy in each state
+            # For each grid position, plot the action probabilities
+            # visualize_action_probs(model, get_initial_state)
+            pass
+
+            # s_ = get_initial_state()
+            # s_[1, 1, 0] = 1
+            # for i in range(5):
+            #     for j in range(5):
+            #         s_[i, j, 0] = 10
+            #         prob_ = model.pi(torch.from_numpy(s_).float())
+            #         print(f"State ({i}, {j}): {prob_}")
+            #         s_[i, j, 0] = 1
+
     plt.plot(ep_returns)
     plt.show()

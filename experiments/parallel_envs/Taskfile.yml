@@ -1,0 +1,95 @@
+version: "3"
+
+tasks:
+  train_vanilla_original:
+    desc: Train vanilla a2c with original observation space
+    cmds:
+      - |
+        python -m rl_for_dummies.a2c_minigrid_parameterised \
+          --env_id MiniGrid-Empty-5x5-v0 \
+          --seed 40 \
+          --experiment_name vanilla_original_16_processes \
+          --n_train_processes 16 \
+          --wrapper_names fully_obs img_obs restricted_actions \
+          --env_size 5 \
+          --conv_input_channels 3 \
+          --action_space_size 3 \
+          --max_train_steps 30000
+
+  train_vanilla_original_seeds:
+    desc: Train vanilla a2c with original observation space with different seeds
+    cmds:
+      - for: ["40", "41", "42", "43", "44"]
+        cmd: |
+          python -m rl_for_dummies.a2c_minigrid_parameterised \
+            --env_id MiniGrid-Empty-5x5-v0 \
+            --seed {{.ITEM}} \
+            --experiment_name vanilla_original_16_processes_{{.ITEM}} \
+            --n_train_processes 16 \
+            --wrapper_names fully_obs img_obs restricted_actions \
+            --env_size 5 \
+            --conv_input_channels 3 \
+            --action_space_size 3 \
+            --max_train_steps 30000
+
+  train_vanilla_one_channel:
+    desc: Train vanilla a2c with one channel observation space
+    cmds:
+      - |
+        python -m rl_for_dummies.a2c_minigrid_parameterised \
+          --env_id MiniGrid-Empty-5x5-v0 \
+          --seed 40 \
+          --experiment_name vanilla_one_channel_16_processes \
+          --n_train_processes 16 \
+          --wrapper_names fully_obs img_obs restricted_actions one_channel \
+          --env_size 5 \
+          --conv_input_channels 1 \
+          --action_space_size 3 \
+          --max_train_steps 30000
+
+  train_vanilla_one_channel_seeds:
+    desc: Train vanilla a2c with one channel observation space with different seeds
+    cmds:
+      - for: ["40", "41", "42", "43", "44"]
+        cmd: |
+          python -m rl_for_dummies.a2c_minigrid_parameterised \
+            --env_id MiniGrid-Empty-5x5-v0 \
+            --seed {{.ITEM}} \
+            --experiment_name vanilla_one_channel_16_processes_{{.ITEM}} \
+            --n_train_processes 16 \
+            --wrapper_names fully_obs img_obs restricted_actions one_channel \
+            --env_size 5 \
+            --conv_input_channels 1 \
+            --action_space_size 3 \
+            --max_train_steps 30000
+
+  train_vanilla_two_channel:
+    desc: Train vanilla a2c with two channel observation space
+    cmds:
+      - |
+        python -m rl_for_dummies.a2c_minigrid_parameterised \
+          --env_id MiniGrid-Empty-5x5-v0 \
+          --seed 40 \
+          --experiment_name vanilla_two_channel_16_processes \
+          --n_train_processes 16 \
+          --wrapper_names fully_obs img_obs restricted_actions two_channel \
+          --env_size 5 \
+          --conv_input_channels 2 \
+          --action_space_size 3 \
+          --max_train_steps 30000
+
+  train_vanilla_two_channel_seeds:
+    desc: Train vanilla a2c with two channel observation space with different seeds
+    cmds:
+      - for: ["40", "41", "42", "43", "44"]
+        cmd: |
+          python -m rl_for_dummies.a2c_minigrid_parameterised \
+            --env_id MiniGrid-Empty-5x5-v0 \
+            --seed {{.ITEM}} \
+            --experiment_name vanilla_two_channel_16_processes_{{.ITEM}} \
+            --n_train_processes 16 \
+            --wrapper_names fully_obs img_obs restricted_actions two_channel \
+            --env_size 5 \
+            --conv_input_channels 2 \
+            --action_space_size 3 \
+            --max_train_steps 30000
