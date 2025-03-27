@@ -1,0 +1,66 @@
+version: "3"
+
+tasks:
+  train_vanilla_8_seeds:
+    desc: Train vanilla a2c using 8 parallel processes
+    cmds:
+      - for: ["40", "41", "42", "43", "44"]
+        cmd: |
+          python -m rl_for_dummies.a2c_minigrid_parameterised \
+            --env_id MiniGrid-Empty-5x5-v0 \
+            --seed {{.ITEM}} \
+            --experiment_name vanilla_8_processes_{{.ITEM}} \
+            --n_train_processes 8 \
+            --wrapper_names fully_obs img_obs restricted_actions two_channel \
+            --env_size 5 \
+            --conv_input_channels 2 \
+            --action_space_size 3 \
+            --max_train_steps 30000
+
+  train_vanilla_16_seeds:
+    desc: Train vanilla a2c using 16 parallel processes
+    cmds:
+      - for: ["40", "41", "42", "43", "44"]
+        cmd: |
+          python -m rl_for_dummies.a2c_minigrid_parameterised \
+            --env_id MiniGrid-Empty-5x5-v0 \
+            --seed {{.ITEM}} \
+            --experiment_name vanilla_16_processes_{{.ITEM}} \
+            --n_train_processes 16 \
+            --wrapper_names fully_obs img_obs restricted_actions two_channel \
+            --env_size 5 \
+            --conv_input_channels 2 \
+            --action_space_size 3 \
+            --max_train_steps 30000
+
+  train_vanilla_32_seeds:
+    desc: Train vanilla a2c using 32 parallel processes
+    cmds:
+      - for: ["40", "41", "42", "43", "44"]
+        cmd: |
+          python -m rl_for_dummies.a2c_minigrid_parameterised \
+            --env_id MiniGrid-Empty-5x5-v0 \
+            --seed {{.ITEM}} \
+            --experiment_name vanilla_32_processes_{{.ITEM}} \
+            --n_train_processes 32 \
+            --wrapper_names fully_obs img_obs restricted_actions two_channel \
+            --env_size 5 \
+            --conv_input_channels 2 \
+            --action_space_size 3 \
+            --max_train_steps 30000
+
+  train_vanilla_64_seeds:
+    desc: Train vanilla a2c using 64 parallel processes
+    cmds:
+      - for: ["40", "41", "42", "43", "44"]
+        cmd: |
+          python -m rl_for_dummies.a2c_minigrid_parameterised \
+            --env_id MiniGrid-Empty-5x5-v0 \
+            --seed {{.ITEM}} \
+            --experiment_name vanilla_64_processes_{{.ITEM}} \
+            --n_train_processes 64 \
+            --wrapper_names fully_obs img_obs restricted_actions two_channel \
+            --env_size 5 \
+            --conv_input_channels 2 \
+            --action_space_size 3 \
+            --max_train_steps 30000
