@@ -63,9 +63,15 @@ dependencies = [
     "optuna-dashboard (>=0.17.0,<0.18.0)",
     "wandb (>=0.19.6,<0.20.0)",
     "seaborn (>=0.13.2,<0.14.0)",
+    # If developing using the Pushworld repo locally, use the line below.
+    # "python3 @ file:///Users/kimyoungjin/Projects/monkey/pushworld/python3",
+    "poetry add git+https://github.com/jugheadjones10/pushworld.git#subdirectory=python3"
 ]
 
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.dependencies]
+python3 = {develop = true}
