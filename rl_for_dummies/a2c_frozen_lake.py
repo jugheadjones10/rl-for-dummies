@@ -144,7 +144,7 @@ def test(step_idx, model):
         s, _ = env.reset()
         while not done:
             prob = model.pi(torch.from_numpy(s).float(), softmax_dim=0)
-            a = Categorical(prob).sample().numpy()
+            a = Categorical(prob).sample().item()
             s_prime, r, terminated, truncated, info = env.step(a)
             done = terminated or truncated
             s = s_prime

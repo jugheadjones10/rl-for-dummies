@@ -12,7 +12,8 @@ from envs.pushworld import BENCHMARK_PUZZLES_PATH, PushWorldEnv
 # Hyperparameters
 learning_rate = 0.0005
 gamma = 0.98
-buffer_limit = 50000
+# buffer_limit = 50000
+buffer_limit = 50
 batch_size = 32
 
 
@@ -87,11 +88,12 @@ class Qnet(nn.Module):
         if coin < epsilon:
             return random.randint(0, 3)
         else:
-            return out.argmax().item()
+            return out.argmax(dim=1).item()
 
 
 def train(q, q_target, memory, optimizer):
-    for i in range(10):
+    # for i in range(10):
+    for i in range(2):
         s, a, r, s_prime, done_mask = memory.sample(batch_size)
 
         q_out = q(s)
@@ -129,13 +131,14 @@ def main():
             done = truncated or done
             done_mask = 0.0 if done else 1.0
             memory.put((s, a, r, s_prime, done_mask))
+
             s = s_prime
 
             score += r
             if done:
                 break
 
-        if memory.size() > 2000:
+        if memory.size() > 30:
             train(q, q_target, memory, optimizer)
 
         if n_epi % print_interval == 0 and n_epi != 0:

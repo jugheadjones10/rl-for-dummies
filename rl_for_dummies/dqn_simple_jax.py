@@ -21,11 +21,14 @@ from torch.utils.tensorboard.writer import SummaryWriter
 from envs.frozen_lake import frozen_lake_make_env
 from envs.frozen_lake import get_network as get_frozen_lake_network
 from envs.minigrid import minigrid_make_env
+from envs.pushworld import get_network as get_pushworld_network
+from envs.pushworld import pushworld_make_env
 
 # Mapping of env-name prefixes to their special env creators and network definitions.
 SPECIAL_ENVS = {
     "FrozenLake": (frozen_lake_make_env, get_frozen_lake_network),
     "MiniGrid": (minigrid_make_env, None),
+    "PushWorld": (pushworld_make_env, get_pushworld_network),
 }
 
 
@@ -51,6 +54,8 @@ class Args:
     """whether to upload the saved model to huggingface"""
     hf_entity: str = ""
     """the user or org name of the model repository from the Hugging Face Hub"""
+    visualize_frequency: Optional[int] = None
+    """the frequency of visualisation"""
 
     # Algorithm specific arguments
     env_id: str = "FrozenLake-v1"
@@ -196,7 +201,7 @@ if __name__ == "__main__":
                 env_maker,
                 args.seed + i,
                 i,
-                args.track,
+                args.capture_video,
                 run_name,
                 **env_kwargs,
             )
@@ -242,6 +247,7 @@ if __name__ == "__main__":
     # Training loop
     obs, _ = envs.reset(seed=args.seed)
     dones = np.zeros(envs.num_envs)
+    episode_count = 0
     for global_step in range(args.total_timesteps):
         epsilon = linear_schedule(
             args.start_e,
@@ -263,7 +269,11 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "episode" in infos:  # Changed from checking "final_info"
-            print(f"global_step={global_step}, episodic_return={infos['episode']['r']}")
+            episode_count += 1
+            print(
+                f"global_step={global_step}, episodic_return={infos['episode']['r']}",
+                flush=True,
+            )
             writer.add_scalar(
                 "charts/episodic_return", infos["episode"]["r"], global_step
             )
@@ -292,11 +302,47 @@ if __name__ == "__main__":
                 "losses/q_values", jax.device_get(old_val).mean(), global_step
             )
             print("SPS:", int(global_step / (time.time() - start_time)))
+            print("Episode count:", episode_count)
             writer.add_scalar(
                 "charts/SPS",
                 int(global_step / (time.time() - start_time)),
                 global_step,
             )
+
+        if (
+            # args.visualize_frequency is not None
+            # and episode_count % args.visualize_frequency == 0
+            # and episode_count != 0
+            global_step % 10000 == 0
+        ):
+            # Recreate env using render mode human and run one episode
+            vis_envs = gym.vector.SyncVectorEnv(
+                [
+                    make_env(
+                        args.env_id,
+                        env_maker,
+                        args.seed,
+                        0,
+                        args.capture_video,
+                        run_name,
+                        render_mode="human",
+                        **env_kwargs,
+                    )
+                ]
+            )
+            _obs, _ = vis_envs.reset(seed=args.seed)
+            _done = np.zeros(1)
+            while not _done[0]:
+                q_values = q_network.apply(q_state.params, _obs)
+                _actions = q_values.argmax(axis=-1)
+                _actions = jax.device_get(_actions)
+                _next_obs, _rewards, _terminations, _truncations, _infos = (
+                    vis_envs.step(_actions)
+                )
+                time.sleep(0.1)
+                _done = np.logical_or(_terminations, _truncations)
+                _obs = _next_obs
+            vis_envs.close()
 
         obs = next_obs
 

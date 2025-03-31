@@ -1,11 +1,10 @@
-import minigrid  # noqa
-import jax.numpy as jnp
-import flax.linen as nn
-from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper  # noqa
-from pushworld.gym_env import PushWorldEnv
 import os
+from typing import Type
 
+import flax.linen as nn
+import jax.numpy as jnp
 from pushworld.config import BENCHMARK_PUZZLES_PATH
+from pushworld.gym_env import PushWorldEnv
 
 
 def pushworld_make_env(env_id, render_mode, **env_kwargs):
@@ -16,6 +15,7 @@ def pushworld_make_env(env_id, render_mode, **env_kwargs):
             "level0",
             "mini",
         ),
+        render_mode=render_mode,
         **env_kwargs,
     )
     return env
@@ -70,3 +70,11 @@ class SimplePushWorldQNetwork(nn.Module):
         # Output layer
         x = nn.Dense(self.action_dim)(x)
         return x
+
+
+def get_network(network_name: str) -> Type[nn.Module]:
+    if network_name not in globals():
+        raise ValueError(
+            f"Unknown network: {network_name}. Available networks: {[n for n in globals() if isinstance(globals()[n], type) and issubclass(globals()[n], nn.Module)]}"
+        )
+    return globals()[network_name]

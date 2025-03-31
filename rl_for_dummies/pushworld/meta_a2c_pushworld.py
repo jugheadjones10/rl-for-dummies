@@ -16,14 +16,19 @@ from torch.distributions import Categorical
 from envs.pushworld import PushWorldEnv
 
 # Hyperparameters
-n_train_processes = 4
+n_train_processes = 8
 learning_rate = 0.0002
-update_interval = 10
 gamma = 0.98
-max_train_steps = 10**7
 entropy_coef = 0.1
 
-PRINT_INTERVAL = 1
+num_policy_updates = 1000
+meta_episode_length = 150
+# The number below is number of steps per policy update.
+# 12,000 = 8 * 150 * 10
+meta_episodes_per_policy_update = 12000 // (n_train_processes * meta_episode_length)
+opt_epochs = 8
+
+PRINT_INTERVAL = 5
 SEED = 42
 
 
@@ -133,7 +138,7 @@ class ActorCritic(nn.Module):
         # Now we step through time steps, using LSTM Cell
         T = x.shape[1]
         features_by_timestep = []
-        for t in range(0, T):
+        for t in range(T):
             h_n, c_n = hidden.chunk(2, dim=1)
             x_t = x[:, t, :]
             h_n, c_n = self.lstm_cell(x_t, (h_n, c_n))
@@ -174,7 +179,7 @@ def worker(worker_id, master_end, worker_end):
             ob, reward, terminated, truncated, info = env.step(data)
             done = terminated or truncated
             if done:
-                ob, _ = env.reset()
+                ob, _ = env.reset(options={"maintain_puzzle": True})
             worker_end.send((ob, reward, done, info))
         elif cmd == "reset":
             ob, _ = env.reset()
@@ -304,12 +309,6 @@ def compute_target(v_final, r_lst, mask_lst):
     return torch.tensor(td_target[::-1]).float()
 
 
-num_policy_updates = 100
-meta_episodes_per_policy_update = 10
-meta_episode_length = 100
-opt_epochs = 10
-
-
 # Data class object to store a meta episode data
 @dataclass
 class MetaEpisodeData:
@@ -322,169 +321,192 @@ class MetaEpisodeData:
 
 
 if __name__ == "__main__":
-    # Seeding
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
+    try:
+        # Seeding
+        random.seed(SEED)
+        np.random.seed(SEED)
+        torch.manual_seed(SEED)
+        torch.cuda.manual_seed_all(SEED)
 
-    envs = ParallelEnv(n_train_processes)
-    model = ActorCritic()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        envs = ParallelEnv(n_train_processes)
+        model = ActorCritic()
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    # B is batch size, which in this case is n_train_processes
-    # T is timesteps, which in this case is meta_episode_length
-    ep_returns = []
-    for policy_update_idx in range(num_policy_updates):
-        meta_episodes = []
-        for _ in range(meta_episodes_per_policy_update):
-            s_lst, a_lst, r_lst, done_lst, v_lst = (
-                list(),
-                list(),
-                list(),
-                list(),
-                list(),
-            )
+        # B is batch size, which in this case is n_train_processes
+        # T is timesteps, which in this case is meta_episode_length
+        policy_update_mean_rewards = []
+        for policy_update_idx in range(num_policy_updates):
+            meta_episodes = []
+            for _ in range(meta_episodes_per_policy_update):
+                s_lst, a_lst, r_lst, done_lst, v_lst = (
+                    list(),
+                    list(),
+                    list(),
+                    list(),
+                    list(),
+                )
 
-            # t means current timestep. tm1 is previous, tp1 is next.
-            s_t = envs.reset()  # [B, 7, 7, 3]
-            a_tm1 = np.zeros((n_train_processes,))  # [B]
-            r_tm1 = np.zeros((n_train_processes,))  # [B]
-            done_tm1 = np.zeros((n_train_processes,))  # [B]
+                # t means current timestep. tm1 is previous, tp1 is next.
+                s_t = envs.reset()  # [B, 7, 7, 4]
+                a_tm1 = np.zeros((n_train_processes,))  # [B]
+                r_tm1 = np.zeros((n_train_processes,))  # [B]
+                done_tm1 = np.zeros((n_train_processes,))  # [B]
 
-            # Initial hidden state
-            hidden_tm1 = model.initial_state(n_train_processes)  # [B, 128]
+                # Initial hidden state
+                hidden_tm1 = model.initial_state(n_train_processes)  # [B, 128]
 
-            for t in range(0, meta_episode_length):
-                prob_t, hidden_t = model.pi(
-                    torch.from_numpy(s_t).float(),
-                    hidden_tm1,
-                    torch.from_numpy(a_tm1).long(),
-                    torch.from_numpy(r_tm1).float(),
-                    torch.from_numpy(done_tm1).float(),
-                )  # [B, 4], [B, 128]
+                for t in range(meta_episode_length):
+                    prob_t, hidden_t = model.pi(
+                        torch.from_numpy(s_t).float(),
+                        hidden_tm1,
+                        torch.from_numpy(a_tm1).long(),
+                        torch.from_numpy(r_tm1).float(),
+                        torch.from_numpy(done_tm1).float(),
+                    )  # [B, 4], [B, 128]
 
-                v_t = model.v(
-                    torch.from_numpy(s_t).float(),
-                    hidden_tm1,
-                    torch.from_numpy(a_tm1).long(),
-                    torch.from_numpy(r_tm1).float(),
-                    torch.from_numpy(done_tm1).float(),
+                    v_t = model.v(
+                        torch.from_numpy(s_t).float(),
+                        hidden_tm1,
+                        torch.from_numpy(a_tm1).long(),
+                        torch.from_numpy(r_tm1).float(),
+                        torch.from_numpy(done_tm1).float(),
+                    )  # [B, 1]
+
+                    a_t = Categorical(prob_t).sample()  # [B]
+
+                    s_tp1, r_t, done_t, _ = envs.step(a_t.detach().numpy())
+
+                    # Store all t values
+                    s_lst.append(s_t)
+                    a_lst.append(a_t.detach().numpy())
+                    r_lst.append(r_t)
+                    done_lst.append(done_t)
+                    v_lst.append(v_t.squeeze(-1).detach().numpy())
+
+                    # Update values
+                    s_t = s_tp1
+                    a_tm1 = a_lst[-1]
+                    r_tm1 = r_lst[-1]
+                    done_tm1 = done_lst[-1]
+                    hidden_tm1 = hidden_t
+
+                # Calculate td targets
+                v_final = (
+                    model.v(
+                        torch.from_numpy(s_t).float(),
+                        hidden_tm1,
+                        torch.from_numpy(a_tm1).long(),
+                        torch.from_numpy(r_tm1).float(),
+                        torch.from_numpy(done_tm1).float(),
+                    )
+                    .detach()
+                    .numpy()
                 )  # [B, 1]
+                td_target = compute_target(v_final, r_lst, done_lst)  # [T, B]
 
-                a_t = Categorical(prob_t).sample()  # [B]
+                v_vec = torch.tensor(v_lst)  # [T, B]
+                # Both td_target and v_vec here are tensors. But do we need them to be?
+                adv_lst = (td_target - v_vec).detach().numpy()  # [T, B]
+                adv_lst = adv_lst.swapaxes(0, 1)  # [B, T]
 
-                s_tp1, r_t, done_t, _ = envs.step(a_t.detach().numpy())
+                s_lst = np.stack(s_lst).swapaxes(0, 1)  # [B, T, 7, 7, 4]
+                a_lst = np.stack(a_lst).swapaxes(0, 1)  # [B, T]
+                r_lst = np.stack(r_lst).swapaxes(0, 1)  # [B, T]
+                done_lst = np.stack(done_lst).swapaxes(0, 1)  # [B, T]
+                v_lst = np.stack(v_lst).swapaxes(0, 1)  # [B, T]
 
-                # Store all t values
-                s_lst.append(s_t)
-                a_lst.append(a_t.detach().numpy())
-                r_lst.append(r_t)
-                done_lst.append(done_t)
-                v_lst.append(v_t.squeeze(-1).detach().numpy())
-
-                # Update values
-                s_t = s_tp1
-                a_tm1 = a_lst[-1]
-                r_tm1 = r_lst[-1]
-                done_tm1 = done_lst[-1]
-                hidden_tm1 = hidden_t
-
-            # Calculate td targets
-            v_final = (
-                model.v(
-                    torch.from_numpy(s_t).float(),
-                    hidden_tm1,
-                    torch.from_numpy(a_tm1).long(),
-                    torch.from_numpy(r_tm1).float(),
-                    torch.from_numpy(done_tm1).float(),
+                meta_episode_data = MetaEpisodeData(
+                    s_lst=s_lst,
+                    a_lst=a_lst,
+                    r_lst=r_lst,
+                    done_lst=done_lst,
+                    v_lst=v_lst,
+                    adv_lst=adv_lst,
                 )
-                .detach()
-                .numpy()
-            )  # [B, 1]
-            td_target = compute_target(v_final, r_lst, done_lst)  # [T, B]
+                meta_episodes.append(meta_episode_data)
 
-            v_vec = torch.tensor(v_lst)  # [T, B]
-            # Both td_target and v_vec here are tensors. But do we need them to be?
-            adv_lst = (td_target - v_vec).detach().numpy()  # [T, B]
-            adv_lst = adv_lst.swapaxes(0, 1)  # [B, T]
-
-            s_lst = np.stack(s_lst).swapaxes(0, 1)  # [B, T, 7, 7, 3]
-            a_lst = np.stack(a_lst).swapaxes(0, 1)  # [B, T]
-            r_lst = np.stack(r_lst).swapaxes(0, 1)  # [B, T]
-            done_lst = np.stack(done_lst).swapaxes(0, 1)  # [B, T]
-            v_lst = np.stack(v_lst).swapaxes(0, 1)  # [B, T]
-
-            meta_episode_data = MetaEpisodeData(
-                s_lst=s_lst,
-                a_lst=a_lst,
-                r_lst=r_lst,
-                done_lst=done_lst,
-                v_lst=v_lst,
-                adv_lst=adv_lst,
+            # Log mean rewards per meta episode
+            mean_rewards = [
+                round(ep.r_lst.sum(axis=1).mean(), 2) for ep in meta_episodes
+            ]
+            print(
+                f"Step #{policy_update_idx}, mean reward mean: {np.mean(mean_rewards)}"
             )
-            meta_episodes.append(meta_episode_data)
+            policy_update_mean_rewards.append(np.mean(mean_rewards))
 
-        # Now we do policy update.
-        # Remember, each meta_episode contains a batch of size B.
-        for opt_epoch in range(opt_epochs):
-            idxs = np.random.permutation(meta_episodes_per_policy_update)
-            for i in range(0, meta_episodes_per_policy_update):
-                meta_episode = meta_episodes[idxs[i]]
+            # Now we do policy update.
+            # Remember, each meta_episode contains a batch of size B.
+            for opt_epoch in range(opt_epochs):
+                idxs = np.random.permutation(meta_episodes_per_policy_update)
+                total_loss = 0
+                for i in range(meta_episodes_per_policy_update):
+                    meta_episode = meta_episodes[idxs[i]]
 
-                # Compute losses
-                mb_s = torch.from_numpy(meta_episode.s_lst).float()  # [B, T, 7, 7, 3]
-                mb_a = torch.from_numpy(meta_episode.a_lst).long()  # [B, T]
-                mb_r = torch.from_numpy(meta_episode.r_lst).float()  # [B, T]
-                mb_done = torch.from_numpy(meta_episode.done_lst).float()  # [B, T]
-                mb_v = torch.from_numpy(meta_episode.v_lst).float()  # [B, T]
-                mb_adv = torch.from_numpy(meta_episode.adv_lst).float()  # [B, T]
+                    # Compute losses
+                    mb_s = torch.from_numpy(
+                        meta_episode.s_lst
+                    ).float()  # [B, T, 7, 7, 4]
+                    mb_a = torch.from_numpy(meta_episode.a_lst).long()  # [B, T]
+                    mb_r = torch.from_numpy(meta_episode.r_lst).float()  # [B, T]
+                    mb_done = torch.from_numpy(meta_episode.done_lst).float()  # [B, T]
+                    mb_v = torch.from_numpy(meta_episode.v_lst).float()  # [B, T]
+                    mb_adv = torch.from_numpy(meta_episode.adv_lst).float()  # [B, T]
 
-                a_dummy = torch.zeros((n_train_processes, 1)).long()  # [B, 1]
-                r_dummy = torch.zeros((n_train_processes, 1))  # [B, 1]
-                done_dummy = torch.zeros((n_train_processes, 1))  # [B, 1]
+                    a_dummy = torch.zeros((n_train_processes, 1)).long()  # [B, 1]
+                    r_dummy = torch.zeros((n_train_processes, 1))  # [B, 1]
+                    done_dummy = torch.zeros((n_train_processes, 1))  # [B, 1]
 
-                prev_action = torch.cat((a_dummy, mb_a[:, :-1]), dim=1)  # [B, T]
-                prev_reward = torch.cat((r_dummy, mb_r[:, :-1]), dim=1)  # [B, T]
-                prev_done = torch.cat((done_dummy, mb_done[:, :-1]), dim=1)  # [B, T]
+                    prev_action = torch.cat((a_dummy, mb_a[:, :-1]), dim=1)  # [B, T]
+                    prev_reward = torch.cat((r_dummy, mb_r[:, :-1]), dim=1)  # [B, T]
+                    prev_done = torch.cat(
+                        (done_dummy, mb_done[:, :-1]), dim=1
+                    )  # [B, T]
 
-                hidden = model.initial_state(n_train_processes)  # [B, 128]
+                    hidden = model.initial_state(n_train_processes)  # [B, 128]
 
-                prob, _ = model.pi(
-                    mb_s,
-                    hidden,
-                    prev_action,
-                    prev_reward,
-                    prev_done,
-                )
+                    prob, _ = model.pi(
+                        mb_s,
+                        hidden,
+                        prev_action,
+                        prev_reward,
+                        prev_done,
+                    )
 
-                v = model.v(
-                    mb_s,
-                    hidden,
-                    prev_action,
-                    prev_reward,
-                    prev_done,
-                )
+                    v = model.v(
+                        mb_s,
+                        hidden,
+                        prev_action,
+                        prev_reward,
+                        prev_done,
+                    )
 
-                entropy = Categorical(prob).entropy()
+                    entropy = Categorical(prob).entropy()
 
-                # Use prob to calculate log prob again using mb_a
-                log_prob_a = torch.log(prob.gather(1, mb_a.unsqueeze(-1)).squeeze(-1))
+                    # Use prob to calculate log prob again using mb_a
+                    log_prob_a = torch.log(
+                        prob.gather(2, mb_a.unsqueeze(-1)).squeeze(-1)
+                    )
 
-                policy_loss = -torch.mean(log_prob_a * mb_adv)
-                value_loss = F.smooth_l1_loss(v.squeeze(-1), mb_v)
-                entropy_loss = -torch.mean(entropy)
+                    policy_loss = -torch.mean(log_prob_a * mb_adv)
+                    value_loss = F.smooth_l1_loss(v.squeeze(-1), mb_v)
+                    entropy_loss = -torch.mean(entropy)
 
-                loss = policy_loss - entropy_coef * entropy_loss + value_loss
+                    loss = policy_loss - entropy_coef * entropy_loss + value_loss
+                    total_loss += loss.item()
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
 
-        if policy_update_idx % PRINT_INTERVAL == 0:
-            avg_score = test(policy_update_idx, model)
-            ep_returns.append(avg_score)
+                # print(
+                #     f"Step #{policy_update_idx}, epoch #{opt_epoch}, loss: {total_loss / meta_episodes_per_policy_update}"
+                # )
 
-    envs.close()
-    plt.plot(ep_returns)
-    plt.show()
+            # if policy_update_idx % PRINT_INTERVAL == 0:
+            #     avg_score = test(policy_update_idx, model)
+            #     ep_returns.append(avg_score)
+
+    finally:
+        envs.close()
+        plt.plot(policy_update_mean_rewards)
+        plt.show()

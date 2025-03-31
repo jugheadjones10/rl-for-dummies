@@ -37,3 +37,15 @@ tasks:
         --exploration-fraction 0.1 \
         --total-timesteps 15000 \
         --env-kwargs '{"is_slippery": false}'
+
+  train_dqn_pushworld:
+    desc: Train PushWorld with DQN (simple)
+    cmds:
+      - |
+        python -m rl_for_dummies.dqn_simple_jax \
+        --env-id "PushWorld-v0" \
+        --exploration-fraction 0.4 \
+        --start-e 0.4 \
+        --total-timesteps 100000 \
+        --network "SimplePushWorldQNetwork" \
+        --visualize-frequency 100

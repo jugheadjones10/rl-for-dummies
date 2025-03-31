@@ -13,10 +13,138 @@
       "console": "integratedTerminal"
     },
     {
+      "name": "Python: RecurrentA2C (Pushworld)",
+      "type": "python",
+      "request": "launch",
+      "module": "rl_for_dummies.pushworld.a2c_recurrent_pushworld",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Python: Simple DQN (Pushworld)",
+      "type": "python",
+      "request": "launch",
+      "module": "rl_for_dummies.pushworld.simple_dqn_pushworld",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Python: PPO (Pushworld)",
+      "type": "python",
+      "request": "launch",
+      "module": "rl_for_dummies.ppo",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Python: REINFORCE (PushWorld)",
+      "type": "python",
+      "request": "launch",
+      "module": "rl_for_dummies.reinforce_pushworld",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Python: A2C (Cartpole)",
+      "type": "python",
+      "request": "launch",
+      "module": "rl_for_dummies.a2c_cartpole",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "PushWorld testing",
+      "type": "python",
+      "request": "launch",
+      "module": "rl_for_dummies.test",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Python: A2C (PushWorld)",
+      "type": "python",
+      "request": "launch",
+      "module": "rl_for_dummies.pushworld.a2c_pushworld",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Python: Meta A2C (PushWorld)",
+      "type": "python",
+      "request": "launch",
+      "module": "rl_for_dummies.pushworld.meta_a2c_pushworld",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Python: Meta A2C (PushWorld)",
+      "type": "python",
+      "request": "launch",
+      "module": "rl_for_dummies.pushworld.meta_a2c_pushworld",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Python: Meta A2C (Tabular MDP)",
+      "type": "python",
+      "request": "launch",
+      "module": "rl_for_dummies.pushworld.meta_a2c_tabular_mdp",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Python: Recurrent A2C (Minigrid)",
+      "type": "python",
+      "request": "launch",
+      "module": "rl_for_dummies.a2c_recurrent_minigrid",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Python: PPO LSTM (Cartpole)",
+      "type": "python",
+      "request": "launch",
+      "module": "rl_for_dummies.ppo_lstm_cartpole",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
       "name": "Python: REINFORCE (FrozenLake) dwarf",
       "type": "python",
       "request": "launch",
-      "module": "rl_for_dummies.dqn_jax_simple_cleanrl_dwarf",
+      "module": "rl_for_dummies.dqn_simple_jax",
+      "args": [
+        "--env-id",
+        "PushWorld",
+        "--network",
+        "SimplePushWorldQNetwork",
+        "--visualize-frequency",
+        "100"
+      ],
       "env": {
         "PYTHONPATH": "${workspaceFolder}"
       },

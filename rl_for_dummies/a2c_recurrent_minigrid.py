@@ -13,31 +13,76 @@ from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper  # noqa
 from torch.distributions import Categorical
 
 # Hyperparameters
-n_train_processes = 4
+n_train_processes = 16
 learning_rate = 0.0002
 update_interval = 10
 gamma = 0.98
 max_train_steps = 10**7
 entropy_coef = 0.1
 
-MINIGRID_ENV = "MiniGrid-Empty-8x8-v0"
+MINIGRID_ENV = "MiniGrid-Empty-5x5-v0"
 PRINT_INTERVAL = update_interval * 10
 SEED = 42
+
+
+# Add a wrapper that restricts the action space to only the used actions (Actions 0, 1, 2)
+class RestrictedActionWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.action_space = gym.spaces.Discrete(3)
+
+
+class SimplifiedStateWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+
+    def reset(self, **kwargs):
+        """Reset the environment and return custom observation"""
+        obs, info = self.env.reset(**kwargs)
+        return self._get_observation(obs), info
+
+    def step(self, action):
+        """Take a step and return custom observation"""
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return self._get_observation(obs), reward, terminated, truncated, info
+
+    def _get_observation(self, obs):
+        """Convert Minigrid observation to custom format"""
+        # Initialize empty 5x5 grid
+        grid = np.zeros((2, 5, 5), dtype=np.uint8)
+
+        obs = obs.transpose(2, 0, 1)
+        object_idx = obs[0]
+
+        wall_pos = np.where(object_idx == 2)
+        grid[0][wall_pos[0], wall_pos[1]] = 3
+
+        agent_pos = np.where(object_idx == 10)
+        grid[0][agent_pos[0], agent_pos[1]] = 1
+
+        goal_pos = np.where(object_idx == 8)
+        grid[0][goal_pos[0], goal_pos[1]] = 2
+
+        # Second grid channel is for direction
+        grid[1][agent_pos[0], agent_pos[1]] = self.unwrapped.agent_dir + 1
+
+        # Return dictionary with grid and direction
+        return grid.transpose(1, 2, 0)
 
 
 class ActorCritic(nn.Module):
     def __init__(self):
         super(ActorCritic, self).__init__()
         # CNN layers
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=2, stride=1)
+        self.conv1 = nn.Conv2d(2, 8, kernel_size=2, stride=1)
 
         # Calculate output size after convolution:
-        conv_output_size = 6 * 6 * 16
+        conv_output_size = 4 * 4 * 8
 
         # Fully connected layers
         self.fc1 = nn.Linear(conv_output_size, 64)
         self.lstm_cell = nn.LSTMCell(64, 64)
-        self.fc_pi = nn.Linear(64, 7)  # 7 actions for MiniGrid
+        self.fc_pi = nn.Linear(64, 3)  # 3 actions for MiniGrid
         self.fc_v = nn.Linear(64, 1)
 
     def forward(self, x, hidden):
@@ -79,8 +124,8 @@ class ActorCritic(nn.Module):
     def pi(self, x, hidden, softmax_dim=1):
         """Policy network: returns action probabilities"""
         embedding, memory = self.forward(x, hidden)
-        x = self.fc_pi(embedding)  # [batch_size, 7]
-        prob = F.softmax(x, dim=softmax_dim)
+        action_logits = self.fc_pi(embedding)  # [batch_size, 3]
+        prob = F.softmax(action_logits, dim=softmax_dim)
         return prob, memory
 
     def v(self, x, hidden):
@@ -93,9 +138,11 @@ class ActorCritic(nn.Module):
 def worker(worker_id, master_end, worker_end):
     master_end.close()  # Forbid worker to use the master end for messaging
     env = gym.make(MINIGRID_ENV)
-    # env = FullyObsWrapper(env)
+    env = FullyObsWrapper(env)
     env = ImgObsWrapper(env)
-    env.action_space.seed(SEED)
+    env = RestrictedActionWrapper(env)
+    env = SimplifiedStateWrapper(env)
+    env.action_space.seed(SEED + worker_id)
 
     while True:
         cmd, data = worker_end.recv()
@@ -173,8 +220,10 @@ class ParallelEnv:
 
 def test(step_idx, model):
     env = gym.make(MINIGRID_ENV)
-    # env = FullyObsWrapper(env)
+    env = FullyObsWrapper(env)
     env = ImgObsWrapper(env)
+    env = RestrictedActionWrapper(env)
+    env = SimplifiedStateWrapper(env)
     env.action_space.seed(SEED)
     score = 0.0
     done = False
@@ -191,10 +240,11 @@ def test(step_idx, model):
             s = s_prime
             score += r
         done = False
-    print(f"Step # :{step_idx}, avg score : {score/num_test:.1f}")
+    avg_score = round(score / num_test, 2)
+    print(f"Step # :{step_idx}, avg score : {avg_score}")
 
     env.close()
-    return score / num_test
+    return avg_score
 
 
 def compute_target(v_final, r_lst, mask_lst):
@@ -214,23 +264,21 @@ if __name__ == "__main__":
     np.random.seed(SEED)
     torch.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
     envs = ParallelEnv(n_train_processes)
-
     model = ActorCritic()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
     step_idx = 0
     s = envs.reset()
+    ep_returns = []
+
     # First half is hidden state, second half is cell state
     initial_state = torch.zeros(
         n_train_processes, 2 * 64, dtype=torch.float
     )  # (n_train_processes, 128)
     h_in = initial_state
-    ep_returns = []
-    while step_idx < max_train_steps:
+    while step_idx < 20000:
         s_lst, a_lst, r_lst, v_lst, mask_lst = list(), list(), list(), list(), list()
         # If h_in is the last hidden output of the previous iterations of the update_interval
         h_initial = h_in.detach()
@@ -296,9 +344,9 @@ if __name__ == "__main__":
         if step_idx % PRINT_INTERVAL == 0:
             avg_score = test(step_idx, model)
             ep_returns.append(avg_score)
-            if avg_score >= 0.9:
-                print(f"Step #{step_idx} finished with avg score {avg_score}")
-                break
+            # if avg_score >= 0.9:
+            #     print(f"Step #{step_idx} finished with avg score {avg_score}")
+            #     break
 
     envs.close()
     plt.plot(ep_returns)
