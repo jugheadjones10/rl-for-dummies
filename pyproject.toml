@@ -65,7 +65,7 @@ dependencies = [
     "seaborn (>=0.13.2,<0.14.0)",
     # If developing using the Pushworld repo locally, use the line below.
     # "python3 @ file:///Users/kimyoungjin/Projects/monkey/pushworld/python3",
-    "poetry add git+https://github.com/jugheadjones10/pushworld.git#subdirectory=python3"
+    "git+https://github.com/jugheadjones10/pushworld.git#subdirectory=python3"
 ]
 
 
