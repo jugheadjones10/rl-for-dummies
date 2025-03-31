@@ -49,3 +49,9 @@ tasks:
         --total-timesteps 100000 \
         --network "SimplePushWorldQNetwork" \
         --visualize-frequency 100
+
+  train_meta_a2c_pushworld:
+    desc: Train PushWorld with Meta A2C (simple)
+    cmds:
+      - |
+        python -m rl_for_dummies.pushworld.meta_a2c_pushworld
