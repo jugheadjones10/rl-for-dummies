@@ -32,14 +32,10 @@ PRINT_INTERVAL = 5
 SEED = 42
 
 
-def make_env(render_mode=None):
+def make_env(render_mode=None, puzzle_dir="train"):
     env = PushWorldEnv(
         max_steps=50,
-        puzzle_path=os.path.join(
-            BENCHMARK_PUZZLES_PATH,
-            "level0",
-            "mini",
-        ),
+        puzzle_path=os.path.join(BENCHMARK_PUZZLES_PATH, "level0", "mini", puzzle_dir),
         render_mode=render_mode,
     )
     return env
@@ -248,11 +244,11 @@ class ParallelEnv:
 
 
 def test(step_idx, model):
-    env = make_env()
+    env = make_env(puzzle_dir="test")
     env.action_space.seed(SEED)
-    score = 0.0
     done = False
-    num_test = 5
+    num_test = 100
+    test_scores = []
     for _ in range(num_test):
         s, _ = env.reset()
         initial_state = model.initial_state(1)
@@ -262,7 +258,8 @@ def test(step_idx, model):
         prev_reward = torch.zeros(1, dtype=torch.float)  # [1]
         prev_done = torch.ones(1, dtype=torch.float)  # [1] (not done)
 
-        while not done:
+        score = 0.0
+        for t in range(meta_episode_length):
             # Convert observation to tensor and add batch dimension
             s_tensor = torch.from_numpy(s).float().unsqueeze(0)  # [1, H, W, C]
 
@@ -277,6 +274,9 @@ def test(step_idx, model):
             a = Categorical(prob).sample().item()
             s_prime, r, terminated, truncated, info = env.step(a)
             done = terminated or truncated
+            if done:
+                s_prime, _ = env.reset(options={"maintain_puzzle": True})
+
             s = s_prime
             score += r
 
@@ -285,9 +285,10 @@ def test(step_idx, model):
             prev_reward = torch.tensor([r], dtype=torch.float)
             prev_done = torch.tensor([0.0 if done else 1.0], dtype=torch.float)
 
-        done = False
-    avg_score = round(score / num_test, 2)
-    print(f"Step # :{step_idx}, avg score : {avg_score}")
+        test_scores.append(score)
+
+    avg_score = np.mean(test_scores)
+    print(f"Step # :{step_idx}, avg test score : {avg_score}")
 
     env.close()
     return avg_score
@@ -335,6 +336,7 @@ if __name__ == "__main__":
         # B is batch size, which in this case is n_train_processes
         # T is timesteps, which in this case is meta_episode_length
         policy_update_mean_rewards = []
+        avg_scores = []
         for policy_update_idx in range(num_policy_updates):
             meta_episodes = []
             for _ in range(meta_episodes_per_policy_update):
@@ -498,15 +500,31 @@ if __name__ == "__main__":
                     loss.backward()
                     optimizer.step()
 
-                # print(
-                #     f"Step #{policy_update_idx}, epoch #{opt_epoch}, loss: {total_loss / meta_episodes_per_policy_update}"
-                # )
-
             # if policy_update_idx % PRINT_INTERVAL == 0:
-            #     avg_score = test(policy_update_idx, model)
-            #     ep_returns.append(avg_score)
+            avg_score = test(policy_update_idx, model)
+            avg_scores.append(avg_score)
 
     finally:
         envs.close()
+        # Create a figure with 2 subplots in 1 row
+        plt.figure(figsize=(12, 5))
+
+        # First subplot (left side)
+        plt.subplot(1, 2, 1)  # 1 row, 2 columns, 1st position
         plt.plot(policy_update_mean_rewards)
+        plt.title("Policy Update Mean Rewards")
+        plt.xlabel("Update")
+        plt.ylabel("Reward")
+
+        # Second subplot (right side)
+        plt.subplot(1, 2, 2)  # 1 row, 2 columns, 2nd position
+        plt.plot(avg_scores)
+        plt.title("Test Mean Rewards")
+        plt.xlabel("Update")
+        plt.ylabel("Reward")
+
+        # Add spacing between subplots
+        plt.tight_layout()
+
+        # Show both plots together
         plt.show()
