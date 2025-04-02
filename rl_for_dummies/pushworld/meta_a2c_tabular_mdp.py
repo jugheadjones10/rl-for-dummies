@@ -1,5 +1,10 @@
+import datetime
+import os
 import random
+import signal
+import sys
 from dataclasses import dataclass
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -8,52 +13,114 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import tyro
 from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper  # noqa
 from torch.distributions import Categorical
+from torch.utils.tensorboard.writer import SummaryWriter
 
 from rl_for_dummies.pushworld.mdp_env import MDPEnv
 
-# Hyperparameters
-n_train_processes = 8
-learning_rate = 0.0002
-gamma = 0.99
-entropy_coef = 0.1
 
-# MDP parameters
-num_states = 10
-num_actions = 5
+@dataclass
+class TrainingConfig:
+    """Configuration for Meta-A2C training on tabular MDP environments"""
 
-# Meta-training hyperparameters
-num_policy_updates = 200
-meta_episode_length = 10
-# meta_episodes_per_policy_update = 240000 // (n_train_processes * meta_episode_length)
-meta_episodes_per_policy_update = 10000 // (n_train_processes * meta_episode_length)
+    # Training hyperparameters
+    n_train_processes: int = 8
+    learning_rate: float = 0.0002
+    gamma: float = 0.99
+    entropy_coef: float = 0.1
 
-opt_epochs = 8
+    # MDP parameters
+    num_states: int = 10
+    num_actions: int = 5
+    max_episode_length: int = 10
+
+    # Meta-learning settings
+    num_policy_updates: int = 12000
+    meta_episode_length: int = 100
+    # We want to collect a total of 24000 episodes across processes
+    meta_episodes_per_policy_update: int = 240000 // 10  # 24000
+
+    # Multiply by n_train_processes
+    meta_episodes_batch_size: int = 60 * 8
+    # This means for each optimization epoch, we will need meta_episodes_per_policy_update iterations to train on all the data.
+    opt_epochs: int = 8
+
+    # Checkpointing
+    checkpoint: bool = False
+    checkpoint_frequency: int = 10
+    """how often to save model weights"""
+    resume_from_checkpoint: Optional[str] = None
+
+    # W&B
+    track: bool = False
+    """if toggled, this experiment will be tracked with Weights and Biases"""
+    wandb_project_name: str = "Meta-RL MDP"
+    """the wandb's project name"""
+    wandb_entity: Optional[str] = None
+    """the entity (team) of wandb's project"""
+
+    # Reproducibility
+    seed: int = 42
 
 
-PRINT_INTERVAL = 5
-SEED = 42
+def plot_results():
+    # Create a figure with 2 subplots in 1 row
+    plt.figure(figsize=(12, 5))
+
+    # First subplot (left side)
+    plt.subplot(1, 2, 1)  # 1 row, 2 columns, 1st position
+    plt.plot(policy_update_mean_rewards)
+    plt.title("Policy Update Mean Rewards")
+    plt.xlabel("Update")
+    plt.ylabel("Reward")
+
+    # Second subplot (right side)
+    plt.subplot(1, 2, 2)  # 1 row, 2 columns, 2nd position
+    plt.plot(avg_scores)
+    plt.title("Test Mean Rewards")
+    plt.xlabel("Update")
+    plt.ylabel("Reward")
+
+    # Add spacing between subplots
+    plt.tight_layout()
+
+    plt.savefig("mdp_training_progress.png")
 
 
-def make_env(render_mode=None):
-    env = MDPEnv(num_states=num_states, num_actions=num_actions)
+def signal_handler(sig, frame):
+    """Custom signal handler for graceful shutdown"""
+    print("\nInterrupted by Ctrl+C. Cleaning up...")
+    # Attempt to close environments safely
+    if envs:
+        envs.close()
+
+    # Plot the results if we have any data
+    if policy_update_mean_rewards and avg_scores:
+        plot_results()
+
+    print("Exiting gracefully...")
+    sys.exit(0)  # Exit cleanly
+
+
+signal.signal(signal.SIGINT, signal_handler)
+
+
+def make_env(config):
+    env = MDPEnv(
+        num_states=config.num_states,
+        num_actions=config.num_actions,
+        max_episode_length=config.max_episode_length,
+    )
     return env
 
 
 class ActorCritic(nn.Module):
-    def __init__(self):
+    def __init__(self, config):
         super(ActorCritic, self).__init__()
-        # CNN layers
-        # self.conv1 = nn.Conv2d(4, 8, kernel_size=2, stride=1)
-
-        # Calculate output size after convolution:
-        # conv_output_size = 6 * 6 * 8
-
-        # Fully connected layers
-        # self.fc1 = nn.Linear(conv_output_size, 64)
-        self.lstm_cell = nn.LSTMCell(num_states + num_actions + 2, 64)
-        self.fc_pi = nn.Linear(64, num_actions)  # 4 actions for PushWorld
+        self.lstm_cell = nn.LSTMCell(config.num_states + config.num_actions + 2, 64)
+        self.fc_pi = nn.Linear(64, config.num_actions)
         self.fc_v = nn.Linear(64, 1)
 
     def initial_state(self, batch_size):
@@ -96,11 +163,10 @@ class ActorCritic(nn.Module):
             reshaped = True
 
         # Concat one-hot encoded prev_action, prev_reward, and prev_done to x
-        x_one_hot = F.one_hot(x, num_classes=num_states)  # [B*T, 10]
+        x_one_hot = F.one_hot(x, num_classes=config.num_states)  # [B*T, num_states]
         prev_action_one_hot = F.one_hot(
-            prev_action, num_classes=num_actions
-        )  # [B*T, 5]
-        # Should this be converted to long or float?
+            prev_action, num_classes=config.num_actions
+        )  # [B*T, num_actions]
         x = torch.cat(
             (
                 x_one_hot,
@@ -109,7 +175,7 @@ class ActorCritic(nn.Module):
                 prev_done.unsqueeze(-1),
             ),
             dim=-1,
-        )  # [B*T, 17]
+        )  # [B*T, num_states+num_actions+2]
 
         # Re-separate the batch and time dimensions
         if reshaped:
@@ -121,9 +187,9 @@ class ActorCritic(nn.Module):
             prev_done = prev_done.reshape(batch_size, time_steps)
         else:
             # If not reshaped, means we are in the first scenario
-            # where x is [B, 17]
+            # where x is [B, num_states+num_actions+2]
             # So we add a single time dimension
-            # [B, 17] -> [B, 1, 17]
+            # [B, num_states+num_actions+2] -> [B, 1, num_states+num_actions+2]
             x = x.unsqueeze(1)
 
         # Now we step through time steps, using LSTM Cell
@@ -159,10 +225,10 @@ class ActorCritic(nn.Module):
         return v
 
 
-def worker(worker_id, master_end, worker_end):
+def worker(worker_id, master_end, worker_end, config):
     master_end.close()  # Forbid worker to use the master end for messaging
-    env = make_env()
-    env.action_space.seed(SEED + worker_id)
+    env = make_env(config)
+    env.action_space.seed(config.seed + worker_id)
 
     while True:
         cmd, data = worker_end.recv()
@@ -187,8 +253,8 @@ def worker(worker_id, master_end, worker_end):
 
 
 class ParallelEnv:
-    def __init__(self, n_train_processes):
-        self.nenvs = n_train_processes
+    def __init__(self, config):
+        self.nenvs = config.n_train_processes
         self.waiting = False
         self.closed = False
         self.workers = list()
@@ -199,7 +265,9 @@ class ParallelEnv:
         for worker_id, (master_end, worker_end) in enumerate(
             zip(master_ends, worker_ends)
         ):
-            p = mp.Process(target=worker, args=(worker_id, master_end, worker_end))
+            p = mp.Process(
+                target=worker, args=(worker_id, master_end, worker_end, config)
+            )
             p.daemon = True
             p.start()
             self.workers.append(p)
@@ -244,12 +312,14 @@ class ParallelEnv:
             self.closed = True
 
 
-def test(step_idx, model):
-    env = make_env()
-    env.action_space.seed(SEED)
+def test(step_idx, model, config):
+    env = make_env(config)
+    env.action_space.seed(config.seed)
     score = 0.0
     done = False
     num_test = 5
+    test_scores = []
+
     for _ in range(num_test):
         s, _ = env.reset()
         initial_state = model.initial_state(1)
@@ -259,7 +329,8 @@ def test(step_idx, model):
         prev_reward = torch.zeros(1, dtype=torch.float)  # [1]
         prev_done = torch.ones(1, dtype=torch.float)  # [1] (not done)
 
-        for t in range(meta_episode_length):
+        episode_score = 0.0
+        for t in range(config.meta_episode_length):
             # Convert observation to tensor and add batch dimension
             s_tensor = torch.from_numpy(np.array([s])).long()  # [1]
 
@@ -275,22 +346,22 @@ def test(step_idx, model):
             s_prime, r, terminated, truncated, info = env.step(a)
             done = terminated or truncated
             s = s_prime
-            score += r
+            episode_score += r
 
             # Update prev_* values for next step
             prev_action = torch.tensor([a], dtype=torch.long)
             prev_reward = torch.tensor([r], dtype=torch.float)
             prev_done = torch.tensor([0.0 if done else 1.0], dtype=torch.float)
 
-        done = False
-    avg_score = round(score / num_test, 2)
-    print(f"Step # :{step_idx}, avg score : {avg_score}")
+        test_scores.append(episode_score)
 
-    # env.close()
+    avg_score = np.mean(test_scores)
+    print(f"Step # :{step_idx}, avg test score : {avg_score}")
+
     return avg_score
 
 
-def compute_target(v_final, r_lst, mask_lst):
+def compute_target(v_final, r_lst, mask_lst, config):
     G = v_final.squeeze(-1)
     td_target = list()
 
@@ -299,11 +370,30 @@ def compute_target(v_final, r_lst, mask_lst):
     # so we do not utilize the usual 'done' masking in this function.
     for r, mask in zip(r_lst[::-1], mask_lst[::-1]):
         # G = r + gamma * G * mask
-        G = r + gamma * G
+        G = r + config.gamma * G
         td_target.append(G)
 
     # Reverse td_target list
     return torch.tensor(td_target[::-1]).float()
+
+
+def load_checkpoint(checkpoint_path, model, optimizer):
+    """Load model and optimizer state from checkpoint."""
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    start_update_idx = checkpoint["policy_update_idx"] + 1
+
+    # Optionally restore tracking metrics
+    if "policy_update_mean_rewards" in checkpoint:
+        global policy_update_mean_rewards
+        policy_update_mean_rewards = checkpoint["policy_update_mean_rewards"]
+
+    if "avg_scores" in checkpoint:
+        global avg_scores
+        avg_scores = checkpoint["avg_scores"]
+
+    return start_update_idx
 
 
 # Data class object to store a meta episode data
@@ -317,24 +407,50 @@ class MetaEpisodeData:
     adv_lst: np.ndarray
 
 
-if __name__ == "__main__":
-    # Seeding
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
+policy_update_mean_rewards = []
+avg_scores = []
+envs = None
+x_one_hot_size = 0  # Will be set to config.num_states in main
+prev_action_one_hot_size = 0  # Will be set to config.num_actions in main
 
-    envs = ParallelEnv(n_train_processes)
-    model = ActorCritic()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+def main(config: TrainingConfig, writer: SummaryWriter):
+    # Set global sizes for one-hot encoding
+    global x_one_hot_size, prev_action_one_hot_size
+    x_one_hot_size = config.num_states
+    prev_action_one_hot_size = config.num_actions
+
+    # Seeding
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    torch.cuda.manual_seed_all(config.seed)
+
+    envs = ParallelEnv(config)
+    model = ActorCritic(config)
+    optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
+
+    if config.resume_from_checkpoint:
+        if config.track and config.resume_from_checkpoint.startswith("wandb:"):
+            # Handle wandb artifacts
+            artifact_name = config.resume_from_checkpoint[6:]  # Remove "wandb:" prefix
+            artifact = wandb.use_artifact(artifact_name)
+            artifact_dir = artifact.download()
+            checkpoint_path = os.path.join(artifact_dir, os.listdir(artifact_dir)[0])
+        else:
+            checkpoint_path = config.resume_from_checkpoint
+
+        start_update_idx = load_checkpoint(checkpoint_path, model, optimizer)
+    else:
+        start_update_idx = 0
 
     # B is batch size, which in this case is n_train_processes
     # T is timesteps, which in this case is meta_episode_length
-    policy_update_mean_rewards = []
-    test_mean_rewards = []
-    for policy_update_idx in range(num_policy_updates):
+    for policy_update_idx in range(start_update_idx, config.num_policy_updates):
         meta_episodes = []
-        for _ in range(meta_episodes_per_policy_update):
+        for _ in range(
+            config.meta_episodes_per_policy_update // config.n_train_processes
+        ):
             envs.new_env()
             s_lst, a_lst, r_lst, done_lst, v_lst = (
                 list(),
@@ -345,22 +461,22 @@ if __name__ == "__main__":
             )
 
             # t means current timestep. tm1 is previous, tp1 is next.
-            s_t = envs.reset()  # [B, 7, 7, 4]
-            a_tm1 = np.zeros((n_train_processes,))  # [B]
-            r_tm1 = np.zeros((n_train_processes,))  # [B]
-            done_tm1 = np.zeros((n_train_processes,))  # [B]
+            s_t = envs.reset()  # [B]
+            a_tm1 = np.zeros((config.n_train_processes,))  # [B]
+            r_tm1 = np.zeros((config.n_train_processes,))  # [B]
+            done_tm1 = np.zeros((config.n_train_processes,))  # [B]
 
             # Initial hidden state
-            hidden_tm1 = model.initial_state(n_train_processes)  # [B, 128]
+            hidden_tm1 = model.initial_state(config.n_train_processes)  # [B, 128]
 
-            for t in range(meta_episode_length):
+            for t in range(config.meta_episode_length):
                 prob_t, hidden_t = model.pi(
                     torch.from_numpy(s_t).long(),
                     hidden_tm1,
                     torch.from_numpy(a_tm1).long(),
                     torch.from_numpy(r_tm1).float(),
                     torch.from_numpy(done_tm1).float(),
-                )  # [B, 4], [B, 128]
+                )  # [B, num_actions], [B, 128]
 
                 v_t = model.v(
                     torch.from_numpy(s_t).long(),
@@ -371,7 +487,6 @@ if __name__ == "__main__":
                 )  # [B, 1]
 
                 a_t = Categorical(prob_t).sample()  # [B]
-
                 s_tp1, r_t, done_t, _ = envs.step(a_t.detach().numpy())
 
                 # Store all t values
@@ -400,14 +515,14 @@ if __name__ == "__main__":
                 .detach()
                 .numpy()
             )  # [B, 1]
-            td_target = compute_target(v_final, r_lst, done_lst)  # [T, B]
+            td_target = compute_target(v_final, r_lst, done_lst, config)  # [T, B]
 
             v_vec = torch.tensor(v_lst)  # [T, B]
             # Both td_target and v_vec here are tensors. But do we need them to be?
             adv_lst = (td_target - v_vec).detach().numpy()  # [T, B]
             adv_lst = adv_lst.swapaxes(0, 1)  # [B, T]
 
-            s_lst = np.stack(s_lst).swapaxes(0, 1)  # [B, T, 7, 7, 4]
+            s_lst = np.stack(s_lst).swapaxes(0, 1)  # [B, T]
             a_lst = np.stack(a_lst).swapaxes(0, 1)  # [B, T]
             r_lst = np.stack(r_lst).swapaxes(0, 1)  # [B, T]
             done_lst = np.stack(done_lst).swapaxes(0, 1)  # [B, T]
@@ -425,34 +540,69 @@ if __name__ == "__main__":
 
         # Log mean rewards per meta episode
         mean_rewards = [round(ep.r_lst.sum(axis=1).mean(), 2) for ep in meta_episodes]
-        print(f"Step #{policy_update_idx}, mean reward mean: {np.mean(mean_rewards)}")
-        policy_update_mean_rewards.append(np.mean(mean_rewards))
-        # Now we do policy update.
-        # Remember, each meta_episode contains a batch of size B.
-        for opt_epoch in range(opt_epochs):
-            idxs = np.random.permutation(meta_episodes_per_policy_update)
+        mean_reward = np.mean(mean_rewards)
+        print(f"Step #{policy_update_idx}, mean reward mean: {mean_reward}")
+        writer.add_scalar("charts/mean_reward", mean_reward, policy_update_idx)
+        policy_update_mean_rewards.append(mean_reward)
+
+        flattened_meta_episodes = []
+        for meta_episode in meta_episodes:
+            for i in range(config.n_train_processes):
+                flattened_meta_episodes.append(
+                    MetaEpisodeData(
+                        s_lst=meta_episode.s_lst[i],
+                        a_lst=meta_episode.a_lst[i],
+                        r_lst=meta_episode.r_lst[i],
+                        done_lst=meta_episode.done_lst[i],
+                        v_lst=meta_episode.v_lst[i],
+                        adv_lst=meta_episode.adv_lst[i],
+                    )
+                )
+        meta_episodes = flattened_meta_episodes
+
+        for opt_epoch in range(config.opt_epochs):
+            idxs = np.random.permutation(config.meta_episodes_per_policy_update)
             total_loss = 0
-            for i in range(meta_episodes_per_policy_update):
-                meta_episode = meta_episodes[idxs[i]]
+            for i in range(
+                0,
+                config.meta_episodes_per_policy_update,
+                config.meta_episodes_batch_size,
+            ):
+                idx_batch = idxs[i : i + config.meta_episodes_batch_size]
+                meta_episodes_batch = [meta_episodes[idx] for idx in idx_batch]
+
+                meta_episode = MetaEpisodeData(
+                    s_lst=np.stack([ep.s_lst for ep in meta_episodes_batch]),
+                    a_lst=np.stack([ep.a_lst for ep in meta_episodes_batch]),
+                    r_lst=np.stack([ep.r_lst for ep in meta_episodes_batch]),
+                    done_lst=np.stack([ep.done_lst for ep in meta_episodes_batch]),
+                    v_lst=np.stack([ep.v_lst for ep in meta_episodes_batch]),
+                    adv_lst=np.stack([ep.adv_lst for ep in meta_episodes_batch]),
+                )
 
                 # Compute losses
-                mb_s = torch.from_numpy(meta_episode.s_lst).long()  # [B, T, 7, 7, 4]
+                mb_s = torch.from_numpy(meta_episode.s_lst).long()  # [B, T]
                 mb_a = torch.from_numpy(meta_episode.a_lst).long()  # [B, T]
                 mb_r = torch.from_numpy(meta_episode.r_lst).float()  # [B, T]
                 mb_done = torch.from_numpy(meta_episode.done_lst).float()  # [B, T]
                 mb_v = torch.from_numpy(meta_episode.v_lst).float()  # [B, T]
                 mb_adv = torch.from_numpy(meta_episode.adv_lst).float()  # [B, T]
 
-                a_dummy = torch.zeros((n_train_processes, 1)).long()  # [B, 1]
-                r_dummy = torch.zeros((n_train_processes, 1))  # [B, 1]
-                done_dummy = torch.zeros((n_train_processes, 1))  # [B, 1]
+                a_dummy = torch.zeros(
+                    (config.meta_episodes_batch_size, 1)
+                ).long()  # [B, 1]
+                r_dummy = torch.zeros((config.meta_episodes_batch_size, 1))  # [B, 1]
+                done_dummy = torch.zeros((config.meta_episodes_batch_size, 1))  # [B, 1]
 
                 prev_action = torch.cat((a_dummy, mb_a[:, :-1]), dim=1)  # [B, T]
                 prev_reward = torch.cat((r_dummy, mb_r[:, :-1]), dim=1)  # [B, T]
                 prev_done = torch.cat((done_dummy, mb_done[:, :-1]), dim=1)  # [B, T]
 
-                hidden = model.initial_state(n_train_processes)  # [B, 128]
+                hidden = model.initial_state(
+                    config.meta_episodes_batch_size
+                )  # [B, 128]
 
+                # Get policy probabilities
                 prob, _ = model.pi(
                     mb_s,
                     hidden,
@@ -461,6 +611,7 @@ if __name__ == "__main__":
                     prev_done,
                 )
 
+                # Get value estimates
                 v = model.v(
                     mb_s,
                     hidden,
@@ -469,55 +620,104 @@ if __name__ == "__main__":
                     prev_done,
                 )
 
+                # Calculate losses
                 entropy = Categorical(prob).entropy()
-
-                # Use prob to calculate log prob again using mb_a
                 log_prob_a = torch.log(prob.gather(2, mb_a.unsqueeze(-1)).squeeze(-1))
 
                 policy_loss = -torch.mean(log_prob_a * mb_adv)
                 value_loss = F.smooth_l1_loss(v.squeeze(-1), mb_v)
                 entropy_loss = -torch.mean(entropy)
 
-                loss = policy_loss - entropy_coef * entropy_loss + value_loss
+                loss = policy_loss - config.entropy_coef * entropy_loss + value_loss
                 total_loss += loss.item()
 
+                # Optimize
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-            # print(
-            #     f"Step #{policy_update_idx}, epoch #{opt_epoch}, loss: {total_loss / meta_episodes_per_policy_update}"
-            # )
+            # Log training metrics
+            avg_loss = total_loss / config.meta_episodes_per_policy_update
+            writer.add_scalar(
+                "charts/loss",
+                avg_loss,
+                policy_update_idx * config.opt_epochs + opt_epoch,
+            )
+            writer.add_scalar(
+                "charts/policy_loss",
+                policy_loss.item(),
+                policy_update_idx * config.opt_epochs + opt_epoch,
+            )
+            writer.add_scalar(
+                "charts/value_loss",
+                value_loss.item(),
+                policy_update_idx * config.opt_epochs + opt_epoch,
+            )
+            writer.add_scalar(
+                "charts/entropy",
+                entropy_loss.item(),
+                policy_update_idx * config.opt_epochs + opt_epoch,
+            )
 
-        if policy_update_idx % PRINT_INTERVAL == 0:
-            avg_score = test(policy_update_idx, model)
-            test_mean_rewards.append(avg_score)
+        # Run evaluation
+        avg_score = test(policy_update_idx, model, config)
+        writer.add_scalar("charts/test_mean_reward", avg_score, policy_update_idx)
+        avg_scores.append(avg_score)
 
-    envs.close()
-    # plt.plot(policy_update_mean_rewards)
-    # plt.show()
-    # plt.plot(test_mean_rewards)
-    # plt.show()
+        # Save checkpoint if enabled
+        if config.checkpoint and policy_update_idx % config.checkpoint_frequency == 0:
+            checkpoint_dir = f"checkpoints/{run_name}"
+            os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Create a figure with 2 subplots in 1 row
-    plt.figure(figsize=(12, 5))
+            checkpoint_path = f"{checkpoint_dir}/checkpoint_{policy_update_idx}.pt"
+            torch.save(
+                {
+                    "policy_update_idx": policy_update_idx,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "policy_update_mean_rewards": policy_update_mean_rewards,
+                    "avg_scores": avg_scores,
+                },
+                checkpoint_path,
+            )
 
-    # First subplot (left side)
-    plt.subplot(1, 2, 1)  # 1 row, 2 columns, 1st position
-    plt.plot(policy_update_mean_rewards)
-    plt.title("Policy Update Mean Rewards")
-    plt.xlabel("Update")
-    plt.ylabel("Reward")
+            if config.track:
+                # Log as W&B Artifact
+                artifact = wandb.Artifact(f"model-{run_name}", type="model")
+                artifact.add_file(checkpoint_path)
+                wandb.log_artifact(artifact)
 
-    # Second subplot (right side)
-    plt.subplot(1, 2, 2)  # 1 row, 2 columns, 2nd position
-    plt.plot(test_mean_rewards)
-    plt.title("Test Mean Rewards")
-    plt.xlabel("Update")
-    plt.ylabel("Reward")
 
-    # Add spacing between subplots
-    plt.tight_layout()
+if __name__ == "__main__":
+    # Parse command line arguments using tyro
+    config = tyro.cli(TrainingConfig)
 
-    # Show both plots together
-    plt.show()
+    run_name = (
+        f"mdp__{config.seed}__{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    )
+    if config.track:
+        import wandb
+
+        wandb.init(
+            project=config.wandb_project_name,
+            entity=config.wandb_entity,
+            sync_tensorboard=True,
+            config=vars(config),
+            name=run_name,
+            monitor_gym=True,
+            save_code=True,
+        )
+    writer = SummaryWriter(f"runs/{run_name}")
+    writer.add_text(
+        "hyperparameters",
+        "|param|value|\n|-|-|\n%s"
+        % ("\n".join([f"|{key}|{value}|" for key, value in vars(config).items()])),
+    )
+
+    try:
+        main(config, writer)
+    finally:
+        if envs:
+            envs.close()
+        writer.close()
+        plot_results()
