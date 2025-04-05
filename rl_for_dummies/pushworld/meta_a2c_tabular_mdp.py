@@ -6,7 +6,6 @@ import sys
 from dataclasses import dataclass
 from typing import Optional
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.multiprocessing as mp
@@ -26,30 +25,31 @@ class TrainingConfig:
     """Configuration for Meta-A2C training on tabular MDP environments"""
 
     # Training hyperparameters
-    n_train_processes: int = 8
+    n_train_processes: int = 2
     learning_rate: float = 0.0002
     gamma: float = 0.99
-    entropy_coef: float = 0.1
+    entropy_coef: float = 0.01
 
     # MDP parameters
-    num_states: int = 10
-    num_actions: int = 5
+    num_states: int = 3
+    num_actions: int = 2
     max_episode_length: int = 10
 
     # Meta-learning settings
     num_policy_updates: int = 12000
     meta_episode_length: int = 100
     # We want to collect a total of 24000 episodes across processes
-    meta_episodes_per_policy_update: int = 240000 // 10  # 24000
+    # Total number of steps / steps per episode
+    meta_episodes_per_policy_update: int = 100
 
     # Multiply by n_train_processes
-    meta_episodes_batch_size: int = 60 * 8
+    meta_episodes_batch_size: int = 10
     # This means for each optimization epoch, we will need meta_episodes_per_policy_update iterations to train on all the data.
-    opt_epochs: int = 8
+    opt_epochs: int = 2
 
     # Checkpointing
     checkpoint: bool = False
-    checkpoint_frequency: int = 10
+    checkpoint_frequency: int = 200
     """how often to save model weights"""
     resume_from_checkpoint: Optional[str] = None
 
@@ -65,41 +65,9 @@ class TrainingConfig:
     seed: int = 42
 
 
-def plot_results():
-    # Create a figure with 2 subplots in 1 row
-    plt.figure(figsize=(12, 5))
-
-    # First subplot (left side)
-    plt.subplot(1, 2, 1)  # 1 row, 2 columns, 1st position
-    plt.plot(policy_update_mean_rewards)
-    plt.title("Policy Update Mean Rewards")
-    plt.xlabel("Update")
-    plt.ylabel("Reward")
-
-    # Second subplot (right side)
-    plt.subplot(1, 2, 2)  # 1 row, 2 columns, 2nd position
-    plt.plot(avg_scores)
-    plt.title("Test Mean Rewards")
-    plt.xlabel("Update")
-    plt.ylabel("Reward")
-
-    # Add spacing between subplots
-    plt.tight_layout()
-
-    plt.savefig("mdp_training_progress.png")
-
-
 def signal_handler(sig, frame):
     """Custom signal handler for graceful shutdown"""
     print("\nInterrupted by Ctrl+C. Cleaning up...")
-    # Attempt to close environments safely
-    if envs:
-        envs.close()
-
-    # Plot the results if we have any data
-    if policy_update_mean_rewards and avg_scores:
-        plot_results()
-
     print("Exiting gracefully...")
     sys.exit(0)  # Exit cleanly
 
@@ -119,12 +87,12 @@ def make_env(config):
 class ActorCritic(nn.Module):
     def __init__(self, config):
         super(ActorCritic, self).__init__()
-        self.lstm_cell = nn.LSTMCell(config.num_states + config.num_actions + 2, 64)
-        self.fc_pi = nn.Linear(64, config.num_actions)
-        self.fc_v = nn.Linear(64, 1)
+        self.lstm_cell = nn.LSTMCell(config.num_states + config.num_actions + 2, 256)
+        self.fc_pi = nn.Linear(256, config.num_actions)
+        self.fc_v = nn.Linear(256, 1)
 
     def initial_state(self, batch_size):
-        return torch.zeros(batch_size, 2 * 64, dtype=torch.float)  # [B, 128]
+        return torch.zeros(batch_size, 2 * 256, dtype=torch.float)  # [B, 512]
 
     def forward(self, x, hidden, prev_action, prev_reward, prev_done):
         """Common forward pass for both policy and value networks"""
@@ -202,13 +170,13 @@ class ActorCritic(nn.Module):
             features_by_timestep.append(h_n)
             hidden = torch.cat((h_n, c_n), dim=1)
 
-        features = torch.stack(features_by_timestep, dim=1)  # [B, T, 64]
+        features = torch.stack(features_by_timestep, dim=1)  # [B, T, 256]
         if T == 1:
-            features = features.squeeze(1)  # [B, 64]
+            features = features.squeeze(1)  # [B, 256]
 
-        # If T == 1, features is [B, 64]
-        # Otherwise, features is [B, T, 64]
-        # hidden is just [B, 128]
+        # If T == 1, features is [B, 256]
+        # Otherwise, features is [B, T, 256]
+        # hidden is just [B, 512]
         return features, hidden
 
     def pi(self, x, hidden, prev_action, prev_reward, prev_done, softmax_dim=-1):
@@ -315,7 +283,6 @@ class ParallelEnv:
 def test(step_idx, model, config):
     env = make_env(config)
     env.action_space.seed(config.seed)
-    score = 0.0
     done = False
     num_test = 5
     test_scores = []
@@ -383,16 +350,6 @@ def load_checkpoint(checkpoint_path, model, optimizer):
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     start_update_idx = checkpoint["policy_update_idx"] + 1
-
-    # Optionally restore tracking metrics
-    if "policy_update_mean_rewards" in checkpoint:
-        global policy_update_mean_rewards
-        policy_update_mean_rewards = checkpoint["policy_update_mean_rewards"]
-
-    if "avg_scores" in checkpoint:
-        global avg_scores
-        avg_scores = checkpoint["avg_scores"]
-
     return start_update_idx
 
 
@@ -407,26 +364,13 @@ class MetaEpisodeData:
     adv_lst: np.ndarray
 
 
-policy_update_mean_rewards = []
-avg_scores = []
-envs = None
-x_one_hot_size = 0  # Will be set to config.num_states in main
-prev_action_one_hot_size = 0  # Will be set to config.num_actions in main
-
-
-def main(config: TrainingConfig, writer: SummaryWriter):
-    # Set global sizes for one-hot encoding
-    global x_one_hot_size, prev_action_one_hot_size
-    x_one_hot_size = config.num_states
-    prev_action_one_hot_size = config.num_actions
-
+def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
     # Seeding
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     torch.cuda.manual_seed_all(config.seed)
 
-    envs = ParallelEnv(config)
     model = ActorCritic(config)
     optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
 
@@ -467,7 +411,7 @@ def main(config: TrainingConfig, writer: SummaryWriter):
             done_tm1 = np.zeros((config.n_train_processes,))  # [B]
 
             # Initial hidden state
-            hidden_tm1 = model.initial_state(config.n_train_processes)  # [B, 128]
+            hidden_tm1 = model.initial_state(config.n_train_processes)  # [B, 512]
 
             for t in range(config.meta_episode_length):
                 prob_t, hidden_t = model.pi(
@@ -476,7 +420,7 @@ def main(config: TrainingConfig, writer: SummaryWriter):
                     torch.from_numpy(a_tm1).long(),
                     torch.from_numpy(r_tm1).float(),
                     torch.from_numpy(done_tm1).float(),
-                )  # [B, num_actions], [B, 128]
+                )  # [B, num_actions], [B, 512]
 
                 v_t = model.v(
                     torch.from_numpy(s_t).long(),
@@ -543,7 +487,6 @@ def main(config: TrainingConfig, writer: SummaryWriter):
         mean_reward = np.mean(mean_rewards)
         print(f"Step #{policy_update_idx}, mean reward mean: {mean_reward}")
         writer.add_scalar("charts/mean_reward", mean_reward, policy_update_idx)
-        policy_update_mean_rewards.append(mean_reward)
 
         flattened_meta_episodes = []
         for meta_episode in meta_episodes:
@@ -637,32 +580,31 @@ def main(config: TrainingConfig, writer: SummaryWriter):
                 optimizer.step()
 
             # Log training metrics
-            avg_loss = total_loss / config.meta_episodes_per_policy_update
-            writer.add_scalar(
-                "charts/loss",
-                avg_loss,
-                policy_update_idx * config.opt_epochs + opt_epoch,
-            )
-            writer.add_scalar(
-                "charts/policy_loss",
-                policy_loss.item(),
-                policy_update_idx * config.opt_epochs + opt_epoch,
-            )
-            writer.add_scalar(
-                "charts/value_loss",
-                value_loss.item(),
-                policy_update_idx * config.opt_epochs + opt_epoch,
-            )
-            writer.add_scalar(
-                "charts/entropy",
-                entropy_loss.item(),
-                policy_update_idx * config.opt_epochs + opt_epoch,
-            )
+            # avg_loss = total_loss / config.meta_episodes_per_policy_update
+            # writer.add_scalar(
+            #     "charts/loss",
+            #     avg_loss,
+            #     policy_update_idx * config.opt_epochs + opt_epoch,
+            # )
+            # writer.add_scalar(
+            #     "charts/policy_loss",
+            #     policy_loss.item(),
+            #     policy_update_idx * config.opt_epochs + opt_epoch,
+            # )
+            # writer.add_scalar(
+            #     "charts/value_loss",
+            #     value_loss.item(),
+            #     policy_update_idx * config.opt_epochs + opt_epoch,
+            # )
+            # writer.add_scalar(
+            #     "charts/entropy",
+            #     entropy_loss.item(),
+            #     policy_update_idx * config.opt_epochs + opt_epoch,
+            # )
 
         # Run evaluation
-        avg_score = test(policy_update_idx, model, config)
-        writer.add_scalar("charts/test_mean_reward", avg_score, policy_update_idx)
-        avg_scores.append(avg_score)
+        # avg_score = test(policy_update_idx, model, config)
+        # writer.add_scalar("charts/test_mean_reward", avg_score, policy_update_idx)
 
         # Save checkpoint if enabled
         if config.checkpoint and policy_update_idx % config.checkpoint_frequency == 0:
@@ -675,8 +617,6 @@ def main(config: TrainingConfig, writer: SummaryWriter):
                     "policy_update_idx": policy_update_idx,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
-                    "policy_update_mean_rewards": policy_update_mean_rewards,
-                    "avg_scores": avg_scores,
                 },
                 checkpoint_path,
             )
@@ -691,6 +631,15 @@ def main(config: TrainingConfig, writer: SummaryWriter):
 if __name__ == "__main__":
     # Parse command line arguments using tyro
     config = tyro.cli(TrainingConfig)
+
+    # Some assertions on the relationship between config parameters
+    assert (
+        config.meta_episodes_per_policy_update % config.n_train_processes == 0
+    ), "num_processes must be a factor of meta_episodes_per_policy_update"
+    # meta_episodes_batch_size has to be a factor of meta_episodes_per_policy_update
+    assert (
+        config.meta_episodes_per_policy_update % config.meta_episodes_batch_size == 0
+    ), "meta_episodes_batch_size must be a factor of meta_episodes_per_policy_update"
 
     run_name = (
         f"mdp__{config.seed}__{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
@@ -715,9 +664,13 @@ if __name__ == "__main__":
     )
 
     try:
-        main(config, writer)
+        envs = ParallelEnv(config)
+        main(config, writer, envs)
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user. Cleaning up...")
     finally:
+        writer.close()
         if envs:
             envs.close()
-        writer.close()
-        plot_results()
+        if config.track:
+            wandb.finish()
