@@ -49,6 +49,9 @@ class TrainingConfig:
     # This means for each optimization epoch, we will need meta_episodes_per_policy_update iterations to train on all the data.
     opt_epochs: int = 2
 
+    # PPO params
+    clip_ratio: float = 0.10
+
     # Checkpointing
     checkpoint: bool = False
     checkpoint_frequency: int = 200
@@ -388,6 +391,7 @@ class MetaEpisodeData:
     done_lst: np.ndarray
     v_lst: np.ndarray
     adv_lst: np.ndarray
+    log_prob_a: np.ndarray
 
 
 def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
@@ -411,7 +415,8 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
         with torch.no_grad():
             for _ in range(config.meta_episodes_per_policy_update):
                 envs.new_env()
-                s_lst, a_lst, r_lst, done_lst, v_lst = (
+                s_lst, a_lst, r_lst, done_lst, v_lst, log_prob_a_lst = (
+                    list(),
                     list(),
                     list(),
                     list(),
@@ -450,7 +455,9 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                         torch.from_numpy(done_tm1).float(),
                     )  # [B, 1]
 
-                    a_t = Categorical(prob_t).sample()  # [B]
+                    dist = Categorical(prob_t)
+                    a_t = dist.sample()  # [B]
+                    log_prob_a_t = dist.log_prob(a_t)  # [B]
                     s_tp1, r_t, done_t, _ = envs.step(a_t.detach().numpy())
 
                     # Store all t values
@@ -459,6 +466,7 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                     r_lst.append(r_t)
                     done_lst.append(done_t)
                     v_lst.append(v_t.squeeze(-1).detach().numpy())
+                    log_prob_a_lst.append(log_prob_a_t.detach().numpy())
 
                     # Update values
                     s_t = s_tp1
@@ -489,6 +497,7 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                 r_lst = np.stack(r_lst).swapaxes(0, 1)  # [B, T]
                 done_lst = np.stack(done_lst).swapaxes(0, 1)  # [B, T]
                 v_lst = np.stack(v_lst).swapaxes(0, 1)  # [B, T]
+                log_prob_a_lst = np.stack(log_prob_a_lst).swapaxes(0, 1)  # [B, T]
 
                 # How to "split" the data so that I can put the meta_episode data for each process into its own MetaEpisodeData object?
                 for i in range(config.n_train_processes):
@@ -500,6 +509,7 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                             done_lst=done_lst[i],
                             v_lst=v_lst[i],
                             adv_lst=adv_lst[i],
+                            log_prob_a=log_prob_a_lst[i],
                         )
                     )
 
@@ -547,7 +557,7 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                     mb_done = get_tensor("done_lst", dtype="float")
                     mb_v = get_tensor("v_lst", dtype="float")
                     mb_adv = get_tensor("adv_lst", dtype="float")
-
+                    mb_log_prob_a = get_tensor("log_prob_a", dtype="float")
                     a_dummy = torch.zeros(
                         (config.meta_episodes_batch_size, 1)
                     ).long()  # [B, 1]
@@ -595,8 +605,16 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                         prob.gather(2, mb_a.unsqueeze(-1)).squeeze(-1)
                     )
 
+                    policy_ratios = torch.exp(log_prob_a - mb_log_prob_a)
+                    clipped_policy_ratios = torch.clip(
+                        policy_ratios, 1 - config.clip_ratio, 1 + config.clip_ratio
+                    )
+                    surr_1 = mb_adv * policy_ratios
+                    surr_2 = mb_adv * clipped_policy_ratios
+                    policy_surrogate_objective = torch.mean(torch.min(surr_1, surr_2))
+
                     policy_loss = -(
-                        torch.mean(log_prob_a * mb_adv)
+                        policy_surrogate_objective
                         + config.entropy_coef * torch.mean(entropy)
                     )
                     value_loss = F.smooth_l1_loss(v.squeeze(-1), mb_v)
@@ -658,7 +676,7 @@ if __name__ == "__main__":
     #     config.meta_episodes_per_policy_update % config.meta_episodes_batch_size == 0
     # ), "meta_episodes_batch_size must be a factor of meta_episodes_per_policy_update"
 
-    run_name = f"mdp-v3__{config.seed}__{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    run_name = f"mdp-v4__{config.seed}__{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     if config.track:
         import wandb
 
