@@ -51,6 +51,7 @@ class TrainingConfig:
 
     # PPO params
     clip_ratio: float = 0.10
+    gae_lambda: float = 0.3
 
     # Checkpointing
     checkpoint: bool = False
@@ -387,6 +388,23 @@ def compute_target(v_final, r_lst, mask_lst, config):
     return torch.tensor(td_target[::-1]).float()
 
 
+def compute_td_lambda_target(r_lst, v_lst, config):
+    T = len(r_lst)
+    td_lambda_target = np.zeros((T, config.n_train_processes), dtype=np.float32)
+    adv_lst = np.zeros((T, config.n_train_processes), dtype=np.float32)
+    for t in reversed(range(T)):
+        r_t = r_lst[t]
+        v_t = v_lst[t]
+        v_tp1 = v_lst[t + 1] if t < T - 1 else 0.0
+        adv_tp1 = adv_lst[t + 1] if t < T - 1 else 0.0
+        delta_t = -v_t + r_t + config.gamma * v_tp1
+        adv_t = delta_t + config.gamma * config.gae_lambda * adv_tp1
+        adv_lst[t] = adv_t
+        td_lambda_target[t] = v_t + adv_t
+
+    return td_lambda_target, adv_lst
+
+
 def load_checkpoint(
     checkpoint_path, policy_net, value_net, policy_optimizer, value_optimizer
 ):
@@ -409,6 +427,7 @@ class MetaEpisodeData:
     done_lst: np.ndarray
     v_lst: np.ndarray
     adv_lst: np.ndarray
+    td_lambda_target: np.ndarray
     log_prob_a: np.ndarray
 
 
@@ -494,22 +513,12 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                     hidden_tm1_policy = hidden_t_policy
                     hidden_tm1_value = hidden_t_value
 
-                # Calculate td targets
-                v_final, _ = value_net(
-                    torch.from_numpy(s_t).long(),
-                    hidden_tm1_value,
-                    torch.from_numpy(a_tm1).long(),
-                    torch.from_numpy(r_tm1).float(),
-                    torch.from_numpy(done_tm1).float(),
-                )  # [B, 1]
-                v_final = v_final.detach().numpy()
-                td_target = compute_target(v_final, r_lst, done_lst, config)  # [T, B]
+                td_lambda_target, adv_lst = compute_td_lambda_target(
+                    r_lst, v_lst, config
+                )  # [T, B] for both
 
-                v_vec = torch.tensor(v_lst)  # [T, B]
-                # Both td_target and v_vec here are tensors. But do we need them to be?
-                adv_lst = (td_target - v_vec).detach().numpy()  # [T, B]
                 adv_lst = adv_lst.swapaxes(0, 1)  # [B, T]
-
+                td_lambda_target = td_lambda_target.swapaxes(0, 1)  # [B, T]
                 s_lst = np.stack(s_lst).swapaxes(0, 1)  # [B, T]
                 a_lst = np.stack(a_lst).swapaxes(0, 1)  # [B, T]
                 r_lst = np.stack(r_lst).swapaxes(0, 1)  # [B, T]
@@ -527,6 +536,7 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                             done_lst=done_lst[i],
                             v_lst=v_lst[i],
                             adv_lst=adv_lst[i],
+                            td_lambda_target=td_lambda_target[i],
                             log_prob_a=log_prob_a_lst[i],
                         )
                     )
@@ -573,7 +583,7 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                     mb_a = get_tensor("a_lst", dtype="long")
                     mb_r = get_tensor("r_lst", dtype="float")
                     mb_done = get_tensor("done_lst", dtype="float")
-                    mb_v = get_tensor("v_lst", dtype="float")
+                    mb_td_lambda_target = get_tensor("td_lambda_target", dtype="float")
                     mb_adv = get_tensor("adv_lst", dtype="float")
                     mb_log_prob_a = get_tensor("log_prob_a", dtype="float")
                     a_dummy = torch.zeros(
@@ -635,7 +645,7 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                         policy_surrogate_objective
                         + config.entropy_coef * torch.mean(entropy)
                     )
-                    value_loss = F.smooth_l1_loss(v.squeeze(-1), mb_v)
+                    value_loss = F.smooth_l1_loss(v.squeeze(-1), mb_td_lambda_target)
 
                     policy_loss.backward(retain_graph=True)
                     value_loss.backward()
@@ -694,7 +704,7 @@ if __name__ == "__main__":
     #     config.meta_episodes_per_policy_update % config.meta_episodes_batch_size == 0
     # ), "meta_episodes_batch_size must be a factor of meta_episodes_per_policy_update"
 
-    run_name = f"mdp-v4__{config.seed}__{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    run_name = f"mdp-v6__{config.seed}__{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     if config.track:
         import wandb
 
