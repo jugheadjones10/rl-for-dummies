@@ -28,7 +28,8 @@ class TrainingConfig:
     n_train_processes: int = 2
     learning_rate: float = 0.0002
     gamma: float = 0.99
-    entropy_coef: float = 0.01
+    adam_weight_decay: float = 0.01
+    adam_eps: float = 1e-5
 
     # MDP parameters
     num_states: int = 3
@@ -50,6 +51,7 @@ class TrainingConfig:
     opt_epochs: int = 2
 
     # PPO params
+    entropy_coef: float = 0.01
     clip_ratio: float = 0.10
     gae_lambda: float = 0.3
 
@@ -431,6 +433,21 @@ class MetaEpisodeData:
     log_prob_a: np.ndarray
 
 
+def get_weight_decay_param_groups(model, weight_decay):
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        elif len(param.shape) == 1:
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
 def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
     # Seeding
     random.seed(config.seed)
@@ -440,8 +457,16 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
 
     policy_net = PolicyNetwork(config)
     value_net = ValueNetwork(config)
-    policy_optimizer = optim.Adam(policy_net.parameters(), lr=config.learning_rate)
-    value_optimizer = optim.Adam(value_net.parameters(), lr=config.learning_rate)
+    policy_optimizer = optim.AdamW(
+        get_weight_decay_param_groups(policy_net, config.adam_weight_decay),
+        lr=config.learning_rate,
+        eps=config.adam_eps,
+    )
+    value_optimizer = optim.AdamW(
+        get_weight_decay_param_groups(value_net, config.adam_weight_decay),
+        lr=config.learning_rate,
+        eps=config.adam_eps,
+    )
 
     # B is batch size, which in this case is n_train_processes
     # T is timesteps, which in this case is meta_episode_length
@@ -703,7 +728,7 @@ if __name__ == "__main__":
     #     config.meta_episodes_per_policy_update % config.meta_episodes_batch_size == 0
     # ), "meta_episodes_batch_size must be a factor of meta_episodes_per_policy_update"
 
-    run_name = f"mdp-v7__{config.seed}__{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    run_name = f"mdp-v8__{config.seed}__{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     if config.track:
         import wandb
 
