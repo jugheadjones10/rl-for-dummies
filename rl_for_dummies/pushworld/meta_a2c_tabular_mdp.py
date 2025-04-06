@@ -93,6 +93,18 @@ class RecurrentNetwork(nn.Module):
     def __init__(self, config):
         super(RecurrentNetwork, self).__init__()
         self.lstm_cell = nn.LSTMCell(config.num_states + config.num_actions + 2, 256)
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize LSTM weights using Xavier normal initialization"""
+        # For each weight tensor in the LSTM cell
+        for name, param in self.lstm_cell.named_parameters():
+            if "weight" in name:
+                # Apply Xavier normal initialization to all weight matrices
+                nn.init.xavier_normal_(param)
+            elif "bias" in name:
+                # Initialize bias terms to zero (LSTM has 2 bias vectors)
+                nn.init.zeros_(param)
 
     def initial_state(self, batch_size):
         return torch.zeros(batch_size, 2 * 256, dtype=torch.float)  # [B, 512]
@@ -189,6 +201,9 @@ class PolicyNetwork(nn.Module):
         self.recurrent = RecurrentNetwork(config)
         self.fc_pi = nn.Linear(256, config.num_actions)
 
+        nn.init.xavier_normal_(self.fc_pi.weight)
+        nn.init.zeros_(self.fc_pi.bias)
+
     def initial_state(self, batch_size):
         return self.recurrent.initial_state(batch_size)
 
@@ -206,6 +221,9 @@ class ValueNetwork(nn.Module):
         super(ValueNetwork, self).__init__()
         self.recurrent = RecurrentNetwork(config)
         self.fc_v = nn.Linear(256, 1)
+
+        nn.init.xavier_normal_(self.fc_v.weight)
+        nn.init.zeros_(self.fc_v.bias)
 
     def initial_state(self, batch_size):
         return self.recurrent.initial_state(batch_size)
