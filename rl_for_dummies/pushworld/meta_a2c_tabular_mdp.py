@@ -42,10 +42,10 @@ class TrainingConfig:
     # Total number of steps / steps per episode
     # Update: this is now for within a process
     # So total meta_episodes is n_procs * meta_episodes_per_policy_update
-    meta_episodes_per_policy_update: int = 50
+    meta_episodes_per_policy_update: int = 100
 
     # Multiply by n_train_processes
-    meta_episodes_batch_size: int = 10
+    meta_episodes_batch_size: int = 20
     # This means for each optimization epoch, we will need meta_episodes_per_policy_update iterations to train on all the data.
     opt_epochs: int = 2
 
@@ -465,7 +465,7 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                 s_t = envs.reset()  # [B]
                 a_tm1 = np.zeros((config.n_train_processes,))  # [B]
                 r_tm1 = np.zeros((config.n_train_processes,))  # [B]
-                done_tm1 = np.zeros((config.n_train_processes,))  # [B]
+                done_tm1 = np.ones((config.n_train_processes,))  # [B]
 
                 # Initial hidden state
                 hidden_tm1_policy = policy_net.initial_state(
@@ -592,7 +592,7 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                     r_dummy = torch.zeros(
                         (config.meta_episodes_batch_size, 1)
                     )  # [B, 1]
-                    done_dummy = torch.zeros(
+                    done_dummy = torch.ones(
                         (config.meta_episodes_batch_size, 1)
                     )  # [B, 1]
 
