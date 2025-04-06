@@ -213,8 +213,8 @@ class PolicyNetwork(nn.Module):
             x, hidden, prev_action, prev_reward, prev_done
         )
         action_logits = self.fc_pi(features)
-        prob = F.softmax(action_logits, dim=softmax_dim)
-        return prob, hidden
+        # prob = F.softmax(action_logits, dim=softmax_dim)
+        return action_logits, hidden
 
 
 class ValueNetwork(nn.Module):
@@ -476,7 +476,7 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                 )  # [B, 512]
 
                 for t in range(config.meta_episode_length):
-                    prob_t, hidden_t_policy = policy_net(
+                    pi_dist_t, hidden_t_policy = policy_net(
                         torch.from_numpy(s_t).long(),
                         hidden_tm1_policy,
                         torch.from_numpy(a_tm1).long(),
@@ -492,7 +492,7 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                         torch.from_numpy(done_tm1).float(),
                     )  # [B, 1]
 
-                    dist = Categorical(prob_t)
+                    dist = Categorical(logits=pi_dist_t)
                     a_t = dist.sample()  # [B]
                     log_prob_a_t = dist.log_prob(a_t)  # [B]
                     s_tp1, r_t, done_t, _ = envs.step(a_t.detach().numpy())
@@ -610,7 +610,7 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                     )  # [B, 512]
 
                     # Get policy probabilities
-                    prob, _ = policy_net(
+                    pi_dist, _ = policy_net(
                         mb_s,
                         hidden_policy,
                         prev_action,
@@ -628,10 +628,9 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                     )
 
                     # Calculate losses
-                    entropy = Categorical(prob).entropy()
-                    log_prob_a = torch.log(
-                        prob.gather(2, mb_a.unsqueeze(-1)).squeeze(-1)
-                    )
+                    dist = Categorical(logits=pi_dist)
+                    entropy = dist.entropy()
+                    log_prob_a = dist.log_prob(mb_a)
 
                     policy_ratios = torch.exp(log_prob_a - mb_log_prob_a)
                     clipped_policy_ratios = torch.clip(
@@ -704,7 +703,7 @@ if __name__ == "__main__":
     #     config.meta_episodes_per_policy_update % config.meta_episodes_batch_size == 0
     # ), "meta_episodes_batch_size must be a factor of meta_episodes_per_policy_update"
 
-    run_name = f"mdp-v6__{config.seed}__{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    run_name = f"mdp-v7__{config.seed}__{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     if config.track:
         import wandb
 
