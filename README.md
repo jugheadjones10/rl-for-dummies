@@ -1,4 +1,4 @@
-![icon](./icon.png)
+<img src="icon.png" alt="icon" width="200"/>
 
 # RL for Dummies
 
