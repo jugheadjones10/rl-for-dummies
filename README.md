@@ -2,7 +2,7 @@
 
 # RL for Dummies
 
-RL code and experiments for simple RL algorithms like REINFORCE, in the style of [CleanRL](https://docs.cleanrl.dev/) and [MinimalRL](https://github.com/seungeunrho/minimalRL).
+RL code and experiments for meta-RL algorithms and simple RL algorithms like REINFORCE, in the style of [CleanRL](https://docs.cleanrl.dev/) and [MinimalRL](https://github.com/seungeunrho/minimalRL).
 
 There are dozens of high-quality deep RL libraries out there, but most of them are not hackable. To understand one algorithm from start to finish requires traversing dozens of classes across dozens of modules. Great for engineering and extensibility, not so great for getting your hands dirty as fast as possible.
 
