@@ -14,15 +14,19 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper  # noqa
+from pushworld.data import level0  # noqa
+from pushworld.data.shuffle import shuffle_puzzles
+from pushworld.gym_env import PushWorldEnv
 from torch.distributions import Categorical
 from torch.utils.tensorboard.writer import SummaryWriter
-
-from rl_for_dummies.pushworld.mdp_env import MDPEnv
 
 
 @dataclass
 class TrainingConfig:
     """Configuration for Meta-A2C training on tabular MDP environments"""
+
+    # Environment settings
+    max_steps: int = 50
 
     # Training hyperparameters
     n_train_processes: int = 2
@@ -31,29 +35,23 @@ class TrainingConfig:
     adam_weight_decay: float = 0.01
     adam_eps: float = 1e-5
 
-    # MDP parameters
-    num_states: int = 3
-    num_actions: int = 2
-    max_episode_length: int = 10
-
     # Meta-learning settings
-    num_policy_updates: int = 1000
-    meta_episode_length: int = 100
-    # We want to collect a total of 24000 episodes across processes
-    # Total number of steps / steps per episode
-    # Update: this is now for within a process
-    # So total meta_episodes is n_procs * meta_episodes_per_policy_update
-    meta_episodes_per_policy_update: int = 100
+    num_policy_updates: int = 2000
+    meta_episode_length: int = 500
+    meta_episodes_per_policy_update: int = 32
 
-    # Multiply by n_train_processes
-    meta_episodes_batch_size: int = 20
-    # This means for each optimization epoch, we will need meta_episodes_per_policy_update iterations to train on all the data.
-    opt_epochs: int = 2
+    meta_episodes_batch_size: int = 8
+    opt_epochs: int = 6
 
     # PPO params
     entropy_coef: float = 0.01
     clip_ratio: float = 0.10
     gae_lambda: float = 0.3
+
+    # Braindead puzzles shuffle
+    train_percentage: float = 0.01
+    test_percentage: float = 0.01
+    archive_percentage: float = 0.98
 
     # Checkpointing
     checkpoint: bool = False
@@ -64,7 +62,7 @@ class TrainingConfig:
     # W&B
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "Meta-RL MDP"
+    wandb_project_name: str = "Meta-RL PushWorld Level 0 no test"
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
@@ -83,11 +81,15 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 
-def make_env(config):
-    env = MDPEnv(
-        num_states=config.num_states,
-        num_actions=config.num_actions,
-        max_episode_length=config.max_episode_length,
+def make_env(config, seed, render_mode=None, puzzle_dir="train"):
+    env = PushWorldEnv(
+        max_steps=config.max_steps,
+        puzzle_path=os.path.join(
+            level0.__path__[0],
+            puzzle_dir,
+        ),
+        render_mode=render_mode,
+        seed=seed,
     )
     return env
 
@@ -95,7 +97,9 @@ def make_env(config):
 class RecurrentNetwork(nn.Module):
     def __init__(self, config):
         super(RecurrentNetwork, self).__init__()
-        self.lstm_cell = nn.LSTMCell(config.num_states + config.num_actions + 2, 256)
+        self.conv1 = nn.Conv2d(4, 8, kernel_size=2, stride=1)
+        conv_output_size = 6 * 6 * 8
+        self.lstm_cell = nn.LSTMCell(conv_output_size + 6, 256)
         self._init_weights()
 
     def _init_weights(self):
@@ -137,31 +141,37 @@ class RecurrentNetwork(nn.Module):
         # [B, T] (Time dimension: happens during training)
 
         reshaped = False
-        if len(x.shape) == 2:
+        if len(x.shape) == 5:
             # For x: [B, T] -> [B*T]
             # For prevs: [B, T] -> [B*T]
             batch_size = x.shape[0]
             time_steps = x.shape[1]
-            x = x.reshape(batch_size * time_steps)
+            x = x.reshape(batch_size * time_steps, *x.shape[2:])
             prev_action = prev_action.reshape(batch_size * time_steps)
             prev_reward = prev_reward.reshape(batch_size * time_steps)
             prev_done = prev_done.reshape(batch_size * time_steps)
             reshaped = True
 
+        # Convert from [B, H, W, C] to [B, C, H, W] for Conv2d
+        x = x.permute(0, 3, 1, 2)
+
+        # CNN feature extraction
+        x = F.relu(self.conv1(x))
+
+        # Flatten for fully connected layers
+        x = x.reshape(x.size(0), -1)  # [B*T, conv_output_size]
+
         # Concat one-hot encoded prev_action, prev_reward, and prev_done to x
-        x_one_hot = F.one_hot(x, num_classes=config.num_states)  # [B*T, num_states]
-        prev_action_one_hot = F.one_hot(
-            prev_action, num_classes=config.num_actions
-        )  # [B*T, num_actions]
+        prev_action_one_hot = F.one_hot(prev_action, num_classes=4)  # [B*T, 4]
         x = torch.cat(
             (
-                x_one_hot,
+                x,
                 prev_action_one_hot,
                 prev_reward.unsqueeze(-1),
                 prev_done.unsqueeze(-1),
             ),
             dim=-1,
-        )  # [B*T, num_states+num_actions+2]
+        )  # [B*T, 294]
 
         # Re-separate the batch and time dimensions
         if reshaped:
@@ -202,7 +212,7 @@ class PolicyNetwork(nn.Module):
     def __init__(self, config):
         super(PolicyNetwork, self).__init__()
         self.recurrent = RecurrentNetwork(config)
-        self.fc_pi = nn.Linear(256, config.num_actions)
+        self.fc_pi = nn.Linear(256, 4)
 
         nn.init.xavier_normal_(self.fc_pi.weight)
         nn.init.zeros_(self.fc_pi.bias)
@@ -215,7 +225,6 @@ class PolicyNetwork(nn.Module):
             x, hidden, prev_action, prev_reward, prev_done
         )
         action_logits = self.fc_pi(features)
-        # prob = F.softmax(action_logits, dim=softmax_dim)
         return action_logits, hidden
 
 
@@ -241,7 +250,7 @@ class ValueNetwork(nn.Module):
 
 def worker(worker_id, master_end, worker_end, config):
     master_end.close()  # Forbid worker to use the master end for messaging
-    env = make_env(config)
+    env = make_env(config, config.seed + worker_id)
     env.action_space.seed(config.seed + worker_id)
 
     while True:
@@ -250,7 +259,7 @@ def worker(worker_id, master_end, worker_end, config):
             ob, reward, terminated, truncated, info = env.step(data)
             done = terminated or truncated
             if done:
-                ob, _ = env.reset()
+                ob, _ = env.reset(options={"maintain_puzzle": True})
             worker_end.send((ob, reward, done, info))
         elif cmd == "reset":
             ob, _ = env.reset()
@@ -258,8 +267,6 @@ def worker(worker_id, master_end, worker_end, config):
         elif cmd == "close":
             worker_end.close()
             break
-        elif cmd == "new_env":
-            env.new_env()
         elif cmd == "get_spaces":
             worker_end.send((env.observation_space, env.action_space))
         else:
@@ -310,10 +317,6 @@ class ParallelEnv:
         self.step_async(actions)
         return self.step_wait()
 
-    def new_env(self):
-        for master_end in self.master_ends:
-            master_end.send(("new_env", None))
-
     def close(self):  # For clean up resources
         if self.closed:
             return
@@ -326,28 +329,30 @@ class ParallelEnv:
             self.closed = True
 
 
-def test(step_idx, model, config):
-    env = make_env(config)
+def test(step_idx, policy_net, config):
+    env = make_env(config, config.seed + step_idx, puzzle_dir="train")
     env.action_space.seed(config.seed)
     done = False
     num_test = 5
     test_scores = []
-
+    final_episode_scores = []
     for _ in range(num_test):
         s, _ = env.reset()
-        initial_state = model.initial_state(1)
+        initial_state = policy_net.initial_state(1)
         h_in = initial_state
 
         prev_action = torch.zeros(1, dtype=torch.long)  # [1]
         prev_reward = torch.zeros(1, dtype=torch.float)  # [1]
         prev_done = torch.ones(1, dtype=torch.float)  # [1] (not done)
 
+        score = 0.0
         episode_score = 0.0
+        episode_scores = []
         for t in range(config.meta_episode_length):
             # Convert observation to tensor and add batch dimension
-            s_tensor = torch.from_numpy(np.array([s])).long()  # [1]
+            s_tensor = torch.from_numpy(s).float().unsqueeze(0)  # [1, H, W, C]
 
-            prob, h_in = model.pi(
+            prob, h_in = policy_net(
                 s_tensor,
                 h_in,
                 prev_action,  # [1]
@@ -355,23 +360,38 @@ def test(step_idx, model, config):
                 prev_done,  # [1]
             )
 
-            a = Categorical(prob).sample().item()
+            a = Categorical(logits=prob).sample().item()
             s_prime, r, terminated, truncated, info = env.step(a)
-            done = terminated or truncated
-            s = s_prime
+            score += r
             episode_score += r
+            done = terminated or truncated
+            if done:
+                episode_scores.append(episode_score)
+                episode_score = 0.0
+                s_prime, _ = env.reset(options={"maintain_puzzle": True})
+
+            s = s_prime
 
             # Update prev_* values for next step
             prev_action = torch.tensor([a], dtype=torch.long)
             prev_reward = torch.tensor([r], dtype=torch.float)
             prev_done = torch.tensor([0.0 if done else 1.0], dtype=torch.float)
 
+        if episode_scores:
+            final_episode_scores.append(episode_scores[-1])
+        else:
+            final_episode_scores.append(0.0)
+
         test_scores.append(episode_score)
 
     avg_score = np.mean(test_scores)
-    print(f"Step # :{step_idx}, avg test score : {avg_score}")
+    avg_final_episode_score = np.mean(final_episode_scores)
+    print(
+        f"Step # :{step_idx}, avg test score : {avg_score}, avg final episode score : {avg_final_episode_score}"
+    )
 
-    return avg_score
+    env.close()
+    return avg_score, avg_final_episode_score
 
 
 def compute_target(v_final, r_lst, mask_lst, config):
@@ -449,12 +469,6 @@ def get_weight_decay_param_groups(model, weight_decay):
 
 
 def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
-    # Seeding
-    random.seed(config.seed)
-    np.random.seed(config.seed)
-    torch.manual_seed(config.seed)
-    torch.cuda.manual_seed_all(config.seed)
-
     policy_net = PolicyNetwork(config)
     value_net = ValueNetwork(config)
     policy_optimizer = optim.AdamW(
@@ -476,7 +490,6 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
         meta_episodes = [[] for _ in range(config.n_train_processes)]
         with torch.no_grad():
             for _ in range(config.meta_episodes_per_policy_update):
-                envs.new_env()
                 s_lst, a_lst, r_lst, done_lst, v_lst, log_prob_a_lst = (
                     list(),
                     list(),
@@ -502,7 +515,7 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
 
                 for t in range(config.meta_episode_length):
                     pi_dist_t, hidden_t_policy = policy_net(
-                        torch.from_numpy(s_t).long(),
+                        torch.from_numpy(s_t).float(),
                         hidden_tm1_policy,
                         torch.from_numpy(a_tm1).long(),
                         torch.from_numpy(r_tm1).float(),
@@ -510,7 +523,7 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                     )  # [B, num_actions], [B, 512]
 
                     v_t, hidden_t_value = value_net(
-                        torch.from_numpy(s_t).long(),
+                        torch.from_numpy(s_t).float(),
                         hidden_tm1_value,
                         torch.from_numpy(a_tm1).long(),
                         torch.from_numpy(r_tm1).float(),
@@ -604,7 +617,7 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                             return torch.from_numpy(mb_field).long()
                         return torch.from_numpy(mb_field).float()
 
-                    mb_s = get_tensor("s_lst", dtype="long")
+                    mb_s = get_tensor("s_lst", dtype="float")
                     mb_a = get_tensor("a_lst", dtype="long")
                     mb_r = get_tensor("r_lst", dtype="float")
                     mb_done = get_tensor("done_lst", dtype="float")
@@ -688,8 +701,13 @@ def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
                 value_optimizer.step()
 
         # Run evaluation
-        # avg_score = test(policy_update_idx, model, config)
-        # writer.add_scalar("charts/test_mean_reward", avg_score, policy_update_idx)
+        avg_score, avg_final_episode_score = test(policy_update_idx, policy_net, config)
+        writer.add_scalar("charts/test_mean_reward", avg_score, policy_update_idx)
+        writer.add_scalar(
+            "charts/test_mean_episode_return",
+            avg_final_episode_score,
+            policy_update_idx,
+        )
 
         # Save checkpoint if enabled
         if config.checkpoint and policy_update_idx % config.checkpoint_frequency == 0:
@@ -719,16 +737,7 @@ if __name__ == "__main__":
     # Parse command line arguments using tyro
     config = tyro.cli(TrainingConfig)
 
-    # Some assertions on the relationship between config parameters
-    # assert (
-    #     config.meta_episodes_per_policy_update % config.n_train_processes == 0
-    # ), "num_processes must be a factor of meta_episodes_per_policy_update"
-    # meta_episodes_batch_size has to be a factor of meta_episodes_per_policy_update
-    # assert (
-    #     config.meta_episodes_per_policy_update % config.meta_episodes_batch_size == 0
-    # ), "meta_episodes_batch_size must be a factor of meta_episodes_per_policy_update"
-
-    run_name = f"mdp-original__{config.seed}__{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    run_name = f"meta_a2c_level0__{config.seed}__{config.train_percentage}__{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     if config.track:
         import wandb
 
@@ -746,6 +755,21 @@ if __name__ == "__main__":
         "hyperparameters",
         "|param|value|\n|-|-|\n%s"
         % ("\n".join([f"|{key}|{value}|" for key, value in vars(config).items()])),
+    )
+
+    # Seeding
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    torch.cuda.manual_seed_all(config.seed)
+
+    # Shuffle our level0 puzzles based on config
+    shuffle_puzzles(
+        level0.__path__[0],
+        config.train_percentage,
+        config.test_percentage,
+        config.archive_percentage,
+        config.seed,
     )
 
     try:

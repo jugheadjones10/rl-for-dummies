@@ -10,31 +10,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper  # noqa
-from pushworld import mini  # noqa
+from pushworld.config import BENCHMARK_PUZZLES_PATH
+from pushworld import braindead
 from torch.distributions import Categorical
 
 from envs.pushworld import PushWorldEnv
 
 # Hyperparameters
-n_train_processes = 16
+n_train_processes = 2
 learning_rate = 0.0002
-update_interval = 20
+update_interval = 10
 gamma = 0.98
 max_train_steps = 10**7
 entropy_coef = 0.1
 
+max_steps = 30
+
 PRINT_INTERVAL = update_interval * 10
 SEED = 42
 
-
-def make_env(render_mode=None):
+def make_env(render_mode=None, puzzle_dir="test"):
     env = PushWorldEnv(
-        max_steps=50,
+        max_steps=max_steps,
         puzzle_path=os.path.join(
-            mini.__path__[0],
-            "test",
+            braindead.__path__[0],
+            puzzle_dir,
         ),
         render_mode=render_mode,
+        braindead=True,
         seed=SEED,
     )
     return env
@@ -44,10 +47,10 @@ class ActorCritic(nn.Module):
     def __init__(self):
         super(ActorCritic, self).__init__()
         # CNN layers
-        self.conv1 = nn.Conv2d(4, 8, kernel_size=2, stride=1)
+        self.conv1 = nn.Conv2d(2, 4, kernel_size=2, stride=1)
 
         # Calculate output size after convolution:
-        conv_output_size = 6 * 6 * 8
+        conv_output_size = 4 * 4 * 4
 
         # Fully connected layers
         self.fc1 = nn.Linear(conv_output_size, 64)
@@ -62,7 +65,7 @@ class ActorCritic(nn.Module):
         if len(x.shape) == 3:  # Single observation [H,W,C]
             x = x.unsqueeze(0)  # Add batch dimension [1,H,W,C]
         if len(hidden.shape) == 1:
-            hidden = hidden.unsqueeze(0)  # Add batch dimension [1, 256]
+            hidden = hidden.unsqueeze(0)  # Add batch dimension [1, 64]
 
         # Convert from [B,H,W,C] to [B,C,H,W] for Conv2d
         x = x.permute(0, 3, 1, 2)
@@ -185,15 +188,17 @@ class ParallelEnv:
 
 
 def test(step_idx, model):
-    env = make_env()
+    env = make_env(puzzle_dir="test")
     env.action_space.seed(SEED)
-    score = 0.0
     done = False
     num_test = 5
+
+    test_scores = []
     for _ in range(num_test):
         s, _ = env.reset()
         initial_state = torch.zeros(2 * 256, dtype=torch.float)
         h_in = initial_state
+        score = 0.0
         while not done:
             prob, h_in = model.pi(torch.from_numpy(s).float(), h_in)
             a = Categorical(prob).sample().item()
@@ -201,8 +206,9 @@ def test(step_idx, model):
             done = terminated or truncated
             s = s_prime
             score += r
+        test_scores.append(score)
         done = False
-    avg_score = round(score / num_test, 2)
+    avg_score = round(sum(test_scores) / num_test, 2)
     print(f"Step # :{step_idx}, avg score : {avg_score}")
 
     env.close()
@@ -240,7 +246,7 @@ if __name__ == "__main__":
         n_train_processes, 2 * 256, dtype=torch.float
     )  # (n_train_processes, 512)
     h_in = initial_state
-    while step_idx < max_train_steps:
+    while step_idx < 30000:
         s_lst, a_lst, r_lst, v_lst, mask_lst = list(), list(), list(), list(), list()
         # If h_in is the last hidden output of the previous iterations of the update_interval
         h_initial = h_in.detach()

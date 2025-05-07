@@ -1,0 +1,49 @@
+version: "3"
+tasks:
+  run-all-varibad:
+    desc: Run all tasks (exclude 0.02 because we ran it already using below)
+    cmds:
+      - task: train_meta_varibad
+        vars:
+          TRAIN: 0.3
+          TEST: 0.05
+          ARCHIVE: 0.65
+      - task: train_meta_varibad
+        vars:
+          TRAIN: 0.5
+          TEST: 0.05
+          ARCHIVE: 0.45
+      - task: train_meta_varibad
+        vars:
+          TRAIN: 0.7
+          TEST: 0.05
+          ARCHIVE: 0.25
+  train_meta_varibad:
+    desc: Train PushWorld with Meta A2C (Varibad)
+    vars:
+      COMMAND: >-
+        poetry run python rl_for_dummies/pushworld/meta_a2c_braindead_pushworld_2_varibad.py
+        --wandb-project-name "Meta-RL PushWorld Braindead Varibad"
+        --n-train-processes 4
+        --num-policy-updates 1000
+        --meta-episode-length 500
+        --meta-episodes-per-policy-update 32
+        --meta-episodes-batch-size 8
+        --opt-epochs 4
+        --train-percentage {{.TRAIN}}
+        --test-percentage {{.TEST}}
+        --archive-percentage {{.ARCHIVE}}
+        --checkpoint
+        --track
+    cmds:
+      - |
+        python -m scripts.submit_exp \
+        --docker-tag juggy69/rl-for-dummies:arm \
+        --archs "linux/arm64" \
+        --exp-script "meta-varibad" \
+        --num-seed 3 \
+        --job-queue "c6g-16xlarge" \
+        --num-vcpu 8 \
+        --num-memory 40000 \
+        --provider aws \
+        --command "{{.COMMAND}}"

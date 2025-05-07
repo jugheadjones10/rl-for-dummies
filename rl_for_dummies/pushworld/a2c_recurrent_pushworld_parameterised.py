@@ -1,7 +1,9 @@
+import datetime
 import os
 import random
+from dataclasses import dataclass
+from typing import Optional
 
-import matplotlib.pyplot as plt
 import minigrid  # noqa
 import numpy as np
 import torch
@@ -9,33 +11,66 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper  # noqa
-from pushworld import mini  # noqa
+import tyro
+from minigrid.wrappers import ImgObsWrapper  # noqa
+from pushworld.data import level0
+from pushworld.data.shuffle import shuffle_puzzles
 from torch.distributions import Categorical
+from torch.utils.tensorboard.writer import SummaryWriter
 
 from envs.pushworld import PushWorldEnv
 
-# Hyperparameters
-n_train_processes = 16
-learning_rate = 0.0002
-update_interval = 20
-gamma = 0.98
-max_train_steps = 10**7
-entropy_coef = 0.1
 
-PRINT_INTERVAL = update_interval * 10
-SEED = 42
+@dataclass
+class TrainingConfig:
+    """Configuration for Recurrent A2C training on MiniGrid environments"""
+
+    # Environment settings
+    max_steps: int = 30
+
+    # Training hyperparameters
+    n_train_processes: int = 8
+    learning_rate: float = 0.0002
+    update_interval: int = 10
+    gamma: float = 0.98
+    max_train_steps: int = 1000000
+    entropy_coef: float = 0.1
+
+    # Output settings
+    evaluate_interval: int = 100
+
+    # Braindead puzzles shuffle
+    train_percentage: float = 0.01
+    test_percentage: float = 0.01
+    archive_percentage: float = 0.98
+
+    # Checkpointing
+    checkpoint: bool = False
+    checkpoint_frequency: int = 10
+    """how often to save model weights"""
+    resume_from_checkpoint: Optional[str] = None
+
+    # W&B
+    track: bool = False
+    """if toggled, this experiment will be tracked with Weights and Biases"""
+    wandb_project_name: str = "Meta-RL PushWorld Level 0"
+    """the wandb's project name"""
+    wandb_entity: Optional[str] = None
+    """the entity (team) of wandb's project"""
+
+    # Reproducibility
+    seed: int = 42
 
 
-def make_env(render_mode=None):
+def make_env(config, seed, render_mode=None, puzzle_dir="train"):
     env = PushWorldEnv(
-        max_steps=50,
+        max_steps=config.max_steps,
         puzzle_path=os.path.join(
-            mini.__path__[0],
-            "test",
+            level0.__path__[0],
+            puzzle_dir,
         ),
         render_mode=render_mode,
-        seed=SEED,
+        seed=seed,
     )
     return env
 
@@ -62,7 +97,7 @@ class ActorCritic(nn.Module):
         if len(x.shape) == 3:  # Single observation [H,W,C]
             x = x.unsqueeze(0)  # Add batch dimension [1,H,W,C]
         if len(hidden.shape) == 1:
-            hidden = hidden.unsqueeze(0)  # Add batch dimension [1, 256]
+            hidden = hidden.unsqueeze(0)  # Add batch dimension [1, 64]
 
         # Convert from [B,H,W,C] to [B,C,H,W] for Conv2d
         x = x.permute(0, 3, 1, 2)
@@ -89,13 +124,11 @@ class ActorCritic(nn.Module):
 
         return embedding, memory
 
-    # x: [batch_size, 7, 7, 3]
-    # hidden: [batch_size, 64]
     def pi(self, x, hidden, softmax_dim=1):
         """Policy network: returns action probabilities"""
         embedding, memory = self.forward(x, hidden)
-        action_logits = self.fc_pi(embedding)  # [batch_size, 4]
-        prob = F.softmax(action_logits, dim=softmax_dim)
+        x = self.fc_pi(embedding)  # [batch_size, 7]
+        prob = F.softmax(x, dim=softmax_dim)
         return prob, memory
 
     def v(self, x, hidden):
@@ -105,10 +138,10 @@ class ActorCritic(nn.Module):
         return v
 
 
-def worker(worker_id, master_end, worker_end):
+def worker(worker_id, master_end, worker_end, config):
     master_end.close()  # Forbid worker to use the master end for messaging
-    env = make_env()
-    env.action_space.seed(SEED + worker_id)
+    env = make_env(config, config.seed + worker_id)
+    env.action_space.seed(config.seed + worker_id)
 
     while True:
         cmd, data = worker_end.recv()
@@ -131,8 +164,8 @@ def worker(worker_id, master_end, worker_end):
 
 
 class ParallelEnv:
-    def __init__(self, n_train_processes):
-        self.nenvs = n_train_processes
+    def __init__(self, config):
+        self.nenvs = config.n_train_processes
         self.waiting = False
         self.closed = False
         self.workers = list()
@@ -143,7 +176,9 @@ class ParallelEnv:
         for worker_id, (master_end, worker_end) in enumerate(
             zip(master_ends, worker_ends)
         ):
-            p = mp.Process(target=worker, args=(worker_id, master_end, worker_end))
+            p = mp.Process(
+                target=worker, args=(worker_id, master_end, worker_end, config)
+            )
             p.daemon = True
             p.start()
             self.workers.append(p)
@@ -184,16 +219,17 @@ class ParallelEnv:
             self.closed = True
 
 
-def test(step_idx, model):
-    env = make_env()
-    env.action_space.seed(SEED)
-    score = 0.0
+def test(model, config):
+    env = make_env(config, config.seed, puzzle_dir="test")
+    env.action_space.seed(config.seed)
     done = False
     num_test = 5
+    test_scores = []
     for _ in range(num_test):
         s, _ = env.reset()
         initial_state = torch.zeros(2 * 256, dtype=torch.float)
         h_in = initial_state
+        score = 0.0
         while not done:
             prob, h_in = model.pi(torch.from_numpy(s).float(), h_in)
             a = Categorical(prob).sample().item()
@@ -201,15 +237,16 @@ def test(step_idx, model):
             done = terminated or truncated
             s = s_prime
             score += r
+        test_scores.append(score)
         done = False
-    avg_score = round(score / num_test, 2)
-    print(f"Step # :{step_idx}, avg score : {avg_score}")
+
+    avg_score = round(sum(test_scores) / num_test, 2)
 
     env.close()
     return avg_score
 
 
-def compute_target(v_final, r_lst, mask_lst):
+def compute_target(v_final, r_lst, mask_lst, gamma):
     G = v_final.reshape(-1)
     td_target = list()
 
@@ -220,32 +257,57 @@ def compute_target(v_final, r_lst, mask_lst):
     return torch.tensor(td_target[::-1]).float()
 
 
-if __name__ == "__main__":
-    # Seeding
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
+def load_checkpoint(checkpoint_path, model, optimizer):
+    """Load model and optimizer state from checkpoint."""
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    start_step_idx = checkpoint["step_idx"] + 1
 
-    envs = ParallelEnv(n_train_processes)
+    # Optionally restore tracking metrics if they exist
+    ep_returns = checkpoint.get("ep_returns", [])
+
+    return start_step_idx, ep_returns
+
+
+def main(config, writer, envs):
     model = ActorCritic()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
 
+    # Initialize step counter and episode returns list
     step_idx = 0
-    s = envs.reset()
-    ep_returns = []
 
+    # Resume from checkpoint if specified
+    if config.resume_from_checkpoint:
+        if config.track and config.resume_from_checkpoint.startswith("wandb:"):
+            # Handle W&B artifacts
+            import wandb
+
+            artifact_name = config.resume_from_checkpoint[6:]  # Remove "wandb:" prefix
+            artifact = wandb.use_artifact(artifact_name)
+            artifact_dir = artifact.download()
+            checkpoint_path = os.path.join(artifact_dir, os.listdir(artifact_dir)[0])
+        else:
+            checkpoint_path = config.resume_from_checkpoint
+
+        step_idx, ep_returns = load_checkpoint(checkpoint_path, model, optimizer)
+        print(f"Resuming from checkpoint at step {step_idx}")
+
+    # Start training
+    s = envs.reset()
     # First half is hidden state, second half is cell state
     initial_state = torch.zeros(
-        n_train_processes, 2 * 256, dtype=torch.float
+        config.n_train_processes, 2 * 256, dtype=torch.float
     )  # (n_train_processes, 512)
     h_in = initial_state
-    while step_idx < max_train_steps:
+
+    while step_idx < config.max_train_steps:
         s_lst, a_lst, r_lst, v_lst, mask_lst = list(), list(), list(), list(), list()
-        # If h_in is the last hidden output of the previous iterations of the update_interval
+        # Save the initial hidden state for backpropagation
         h_initial = h_in.detach()
+
         with torch.no_grad():
-            for _ in range(update_interval):
+            for _ in range(config.update_interval):
                 s = torch.from_numpy(s).float()
                 prob, h_out = model.pi(s, h_in)
                 v = model.v(s, h_in).numpy()  # (num_envs, 1)
@@ -269,7 +331,7 @@ if __name__ == "__main__":
         s_final = torch.from_numpy(s_prime).float()
         v_final = model.v(s_final, h_in).detach().numpy()
         td_target = compute_target(
-            v_final, r_lst, mask_lst
+            v_final, r_lst, mask_lst, config.gamma
         )  # (update_interval, num_envs)
 
         # v_lst: (update_interval, num_envs, 1)
@@ -281,7 +343,7 @@ if __name__ == "__main__":
 
         h_in_ = h_initial
         total_loss = torch.tensor(0.0)
-        for i in range(update_interval):
+        for i in range(config.update_interval):
             prob, h_out_ = model.pi(s_vec[i], h_in_)  # (num_envs, 7)
             pi_a = prob.gather(1, a_vec[i].reshape(-1, 1)).reshape(-1)
 
@@ -292,21 +354,96 @@ if __name__ == "__main__":
                 model.v(s_vec[i], h_in_).reshape(-1), td_target[i]
             ).mean()
 
-            loss = policy_loss + value_loss - entropy * entropy_coef
+            loss = policy_loss - entropy * config.entropy_coef + value_loss
             total_loss += loss
 
             mask = torch.tensor(mask_lst[i], dtype=torch.float32).unsqueeze(-1)
             h_in_ = h_out_ * mask
 
-        total_loss /= update_interval
+        total_loss /= config.update_interval
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
 
-        if step_idx % PRINT_INTERVAL == 0:
-            avg_score = test(step_idx, model)
-            ep_returns.append(avg_score)
+        if step_idx % config.evaluate_interval == 0:
+            avg_score = test(model, config)
+            writer.add_scalar("charts/test_avg_score", avg_score, step_idx)
+            print(f"Step # :{step_idx}, avg score : {avg_score}")
 
-    envs.close()
-    plt.plot(ep_returns)
-    plt.show()
+            # Checkpoint the model if enabled
+            if config.checkpoint and step_idx % config.checkpoint_frequency == 0:
+                checkpoint_dir = f"checkpoints/{run_name}"
+                os.makedirs(checkpoint_dir, exist_ok=True)
+
+                checkpoint_path = f"{checkpoint_dir}/checkpoint_{step_idx}.pt"
+                torch.save(
+                    {
+                        "step_idx": step_idx,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                    },
+                    checkpoint_path,
+                )
+
+                if config.track:
+                    # Log as W&B Artifact
+                    import wandb
+
+                    artifact = wandb.Artifact(f"model-{run_name}", type="model")
+                    artifact.add_file(checkpoint_path)
+                    wandb.log_artifact(artifact)
+
+
+if __name__ == "__main__":
+    # Parse command line arguments using tyro
+    config = tyro.cli(TrainingConfig)
+
+    # Initialize W&B if tracking is enabled
+    run_name = f"recurrent_a2c_level0__{config.seed}__{config.train_percentage}__{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    if config.track:
+        import wandb
+
+        wandb.init(
+            project=config.wandb_project_name,
+            entity=config.wandb_entity,
+            sync_tensorboard=True,
+            config=vars(config),
+            name=run_name,
+            monitor_gym=True,
+            save_code=True,
+        )
+
+    writer = SummaryWriter(f"runs/{run_name}")
+    writer.add_text(
+        "hyperparameters",
+        "|param|value|\n|-|-|\n%s"
+        % ("\n".join([f"|{key}|{value}|" for key, value in vars(config).items()])),
+    )
+
+    # Seeding
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    torch.cuda.manual_seed_all(config.seed)
+
+    # Shuffle our level0 puzzles based on config
+    shuffle_puzzles(
+        level0.__path__[0],
+        config.train_percentage,
+        config.test_percentage,
+        config.archive_percentage,
+        config.seed,
+    )
+
+    try:
+        # Run training
+        envs = ParallelEnv(config)
+        main(config, writer, envs)
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user. Cleaning up...")
+    finally:
+        # Clean up resources
+        writer.close()
+        envs.close()
+        if config.track:
+            wandb.finish()

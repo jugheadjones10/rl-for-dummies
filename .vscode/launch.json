@@ -93,10 +93,22 @@
       "console": "integratedTerminal"
     },
     {
-      "name": "Python: Meta A2C (PushWorld)",
+      "name": "Python: Meta A2C (Braindead PushWorld)",
       "type": "python",
       "request": "launch",
-      "module": "rl_for_dummies.pushworld.meta_a2c_pushworld",
+      "module": "rl_for_dummies.pushworld.meta_a2c_braindead_pushworld",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Python: Varibad",
+      "type": "python",
+      "request": "launch",
+      "module": "rl_for_dummies.pushworld.meta_a2c_braindead_pushworld_2_varibad",
+      "justMyCode": false,
       "env": {
         "PYTHONPATH": "${workspaceFolder}"
       },

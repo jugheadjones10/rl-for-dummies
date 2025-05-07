@@ -161,7 +161,7 @@ class MDPEnv(MetaEpisodicEnv):
 
         done_t = False if t < self._max_ep_length else True
         if done_t and auto_reset:
-            s_tp1 = self.reset()
+            s_tp1, _ = self.reset()
 
         # We add False truncated to the return tuple to adhere to Gymnasium API
         return s_tp1, r_t, done_t, False, {}

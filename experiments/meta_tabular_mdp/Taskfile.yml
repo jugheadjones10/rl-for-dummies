@@ -1,0 +1,50 @@
+version: "3"
+
+tasks:
+  train_meta_a2c_tabular_mdp:
+    desc: Train Tabular MDP with Meta A2C
+    vars:
+      COMMAND: >-
+        poetry run python rl_for_dummies/pushworld/meta_a2c_tabular_mdp.py
+        --track
+    cmds:
+      - |
+        python -m scripts.submit_exp \
+        --docker-tag juggy69/rl-for-dummies:arm \
+        --archs "linux/arm64" \
+        --exp-script "meta-tabular-mdp" \
+        --num-seed 3 \
+        --job-queue "c6g-16xlarge" \
+        --num-vcpu 8 \
+        --num-memory 60000 \
+        --build \
+        --push \
+        --provider aws \
+        --command "{{.COMMAND}}"
+
+  train_meta_a2c_tabular_mdp_original:
+    desc: Train Tabular MDP with Meta A2C
+    vars:
+      COMMAND: >-
+        poetry run python rl_for_dummies/pushworld/meta_a2c_tabular_mdp.py
+        --n-train-processes 8
+        --num-states 10
+        --num-actions 2
+        --num-policy-updates 10000
+        --meta-episodes-per-policy-update 300
+        --meta-episodes-batch-size 60
+        --track
+    cmds:
+      - |
+        python -m scripts.submit_exp \
+        --docker-tag juggy69/rl-for-dummies:arm \
+        --archs "linux/arm64" \
+        --exp-script "meta-tabular-mdp" \
+        --num-seed 3 \
+        --job-queue "c6g-16xlarge" \
+        --num-vcpu 8 \
+        --num-memory 60000 \
+        --build \
+        --push \
+        --provider aws \
+        --command "{{.COMMAND}}"

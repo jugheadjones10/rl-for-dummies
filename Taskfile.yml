@@ -50,8 +50,140 @@ tasks:
         --network "SimplePushWorldQNetwork" \
         --visualize-frequency 100
 
+  build-docker-arm:
+    desc: Build the docker image
+    cmds:
+      - docker build -t juggy69/rl-for-dummies:arm --platform linux/arm64 .
+
+  build-docker-amd:
+    desc: Build the docker image for platform linux/amd64 to push
+    cmds:
+      - docker build -t juggy69/rl-for-dummies:latest --platform linux/amd64 .
+
+  push-docker-arm:
+    desc: Push the docker image
+    cmds:
+      - docker push juggy69/rl-for-dummies:arm
+
+  run-docker:
+    desc: Run the docker image
+    cmds:
+      - docker run -it rl-for-dummies
+      # - docker run -it juggy69/rl-for-dummies:latest
+
   train_meta_a2c_pushworld:
     desc: Train PushWorld with Meta A2C (simple)
     cmds:
       - |
         python -m rl_for_dummies.pushworld.meta_a2c_pushworld
+
+  train_meta_a2c_braindead:
+    desc: Train PushWorld with Meta A2C (braindead)
+    cmds:
+      - |
+        python -m rl_for_dummies.pushworld.meta_a2c_braindead_pushworld \
+        --n-train-processes 2 \
+        --num-policy-updates 60000 \
+        --meta-episode-length 300 \
+        --meta-episodes-per-policy-update 4 \
+        --meta-episodes-batch-size 2 \
+        --opt-epochs 2
+
+  train_recurrent_a2c_braindead:
+    desc: Train PushWorld with Recurrent A2C (braindead)
+    cmds:
+      - |
+        python -m rl_for_dummies.pushworld.a2c_recurrent_braindead_pushworld_parameterised
+
+  train_meta_a2c_tabular_mdp:
+    desc: Train Tabular MDP with Meta A2C
+    cmds:
+      - |
+        python -m rl_for_dummies.pushworld.meta_a2c_tabular_mdp
+
+  # This one is ARM architecture with GPU
+  # Quota for on-demand g instances is 8
+  submit-exp-g5g-braindead-pushworld:
+    desc: Submit the experiment to AWS
+    vars:
+      COMMAND: >-
+        poetry run python rl_for_dummies/pushworld/meta_a2c_braindead_pushworld.py
+        --checkpoint
+        --track
+    cmds:
+      - |
+        python -m scripts.submit_exp \
+        --docker-tag juggy69/rl-for-dummies:arm \
+        --archs "linux/arm64" \
+        --build \
+        --push \
+        --exp-script "pushworld" \
+        --num-seed 1 \
+        --job-queue "g5g-2xlarge" \
+        --num-vcpu 8 \
+        --num-memory 10000 \
+        --provider aws \
+        --command "{{.COMMAND}}"
+
+  # ARM architecture
+  submit-exp-c6g-braindead-pushworld:
+    desc: Submit the experiment to AWS
+    vars:
+      COMMAND: >-
+        poetry run python rl_for_dummies/pushworld/meta_a2c_braindead_pushworld.py
+        --n-train-processes 16
+        --num-policy-updates 12000
+        --meta-episodes-per-policy-update 80
+        --meta-episodes-batch-size 16
+        --checkpoint-frequency 50
+        --checkpoint
+        --track
+    cmds:
+      - |
+        python -m scripts.submit_exp \
+        --docker-tag juggy69/rl-for-dummies:arm \
+        --archs "linux/arm64" \
+        --build \
+        --push \
+        --exp-script "pushworld" \
+        --num-seed 5 \
+        --job-queue "c6g-16xlarge" \
+        --num-vcpu 32 \
+        --num-memory 64000 \
+        --provider aws \
+        --command "{{.COMMAND}}"
+
+  # ARM architecture (Tabular MDP)
+  submit-exp-c6g-tabular-mdp:
+    desc: Submit the experiment to AWS
+    vars:
+      COMMAND: >-
+        poetry run python rl_for_dummies/pushworld/meta_a2c_tabular_mdp.py
+        --num-states 3
+        --num-actions 2
+        --num-policy-updates 20000
+        --n-train-processes 4
+        --meta-episodes-per-policy-update 20
+        --meta-episodes-batch-size 4
+        --opt-epochs 4
+        --checkpoint
+        --track
+    cmds:
+      - |
+        python -m scripts.submit_exp \
+        --docker-tag juggy69/rl-for-dummies:arm \
+        --build \
+        --push \
+        --archs "linux/arm64" \
+        --exp-script "tabular_mdp" \
+        --num-seed 3 \
+        --job-queue "c6g-16xlarge" \
+        --num-vcpu 32 \
+        --num-memory 64000 \
+        --provider aws \
+        --command "{{.COMMAND}}"
+
+  run-nested-task:
+    desc: Run a nested task
+    cmds:
+      - task -t experiments/meta_v_a2c/Taskfile.yml -d ./ train_meta_braindead

@@ -1,0 +1,289 @@
+version: "3"
+tasks:
+  run-all-braindead:
+    desc: Run all tasks (exclude 0.02 because we ran it already using below)
+    cmds:
+      - task: train_meta_braindead
+        vars:
+          TRAIN: 0.05
+          TEST: 0.1
+          ARCHIVE: 0.85
+      - task: train_meta_braindead
+        vars:
+          TRAIN: 0.1
+          TEST: 0.1
+          ARCHIVE: 0.8
+      - task: train_meta_braindead
+        vars:
+          TRAIN: 0.2
+          TEST: 0.1
+          ARCHIVE: 0.7
+      - task: train_meta_braindead
+        vars:
+          TRAIN: 0.5
+          TEST: 0.1
+          ARCHIVE: 0.4
+      - task: train_a2c_braindead
+        vars:
+          TRAIN: 0.05
+          TEST: 0.1
+          ARCHIVE: 0.85
+      - task: train_a2c_braindead
+        vars:
+          TRAIN: 0.1
+          TEST: 0.1
+          ARCHIVE: 0.8
+      - task: train_a2c_braindead
+        vars:
+          TRAIN: 0.2
+          TEST: 0.1
+          ARCHIVE: 0.7
+      - task: train_a2c_braindead
+        vars:
+          TRAIN: 0.5
+          TEST: 0.1
+          ARCHIVE: 0.4
+
+  train_meta_braindead:
+    desc: Train PushWorld with Meta A2C (braindead)
+    vars:
+      COMMAND: >-
+        poetry run python rl_for_dummies/pushworld/meta_a2c_braindead_pushworld_2.py
+        --n-train-processes 8
+        --num-policy-updates 10000
+        --meta-episode-length 300
+        --meta-episodes-per-policy-update 16
+        --meta-episodes-batch-size 4
+        --opt-epochs 4
+        --train-percentage {{.TRAIN}}
+        --test-percentage {{.TEST}}
+        --archive-percentage {{.ARCHIVE}}
+        --checkpoint
+        --track
+    cmds:
+      - |
+        python -m scripts.submit_exp \
+        --docker-tag juggy69/rl-for-dummies:arm \
+        --archs "linux/arm64" \
+        --exp-script "meta-braindead" \
+        --num-seed 3 \
+        --job-queue "c6g-4xlarge" \
+        --num-vcpu 8 \
+        --num-memory 20000 \
+        --provider aws \
+        --command "{{.COMMAND}}"
+
+  train_a2c_braindead:
+    desc: Train PushWorld with A2C (braindead)
+    vars:
+      COMMAND: >-
+        poetry run python rl_for_dummies/pushworld/a2c_recurrent_braindead_pushworld_parameterised.py
+        --n-train-processes 8
+        --update-interval 10
+        --max-train-steps 100000
+        --train-percentage {{.TRAIN}}
+        --test-percentage {{.TEST}}
+        --archive-percentage {{.ARCHIVE}}
+        --checkpoint
+        --track
+    cmds:
+      - |
+        python -m scripts.submit_exp \
+        --docker-tag juggy69/rl-for-dummies:arm \
+        --archs "linux/arm64" \
+        --exp-script "a2c-braindead" \
+        --num-seed 3 \
+        --job-queue "c6g-4xlarge" \
+        --num-vcpu 8 \
+        --num-memory 20000 \
+        --provider aws \
+        --command "{{.COMMAND}}"
+
+  run-all-level0:
+    desc: Run all tasks (exclude 0.02 because we ran it already using below)
+    cmds:
+      - task: train_meta_level0
+        vars:
+          TRAIN: 0.05
+          TEST: 0.05
+          ARCHIVE: 0.9
+      - task: train_meta_level0
+        vars:
+          TRAIN: 0.1
+          TEST: 0.05
+          ARCHIVE: 0.85
+      - task: train_meta_level0
+        vars:
+          TRAIN: 0.2
+          TEST: 0.05
+          ARCHIVE: 0.75
+      - task: train_a2c_level0
+        vars:
+          TRAIN: 0.05
+          TEST: 0.05
+          ARCHIVE: 0.9
+      - task: train_a2c_level0
+        vars:
+          TRAIN: 0.1
+          TEST: 0.05
+          ARCHIVE: 0.85
+      - task: train_a2c_level0
+        vars:
+          TRAIN: 0.2
+          TEST: 0.05
+          ARCHIVE: 0.75
+
+  run-high-train-level0:
+    desc: Run all tasks (exclude 0.02 because we ran it already using below)
+    cmds:
+      - task: train_meta_level0
+        vars:
+          TRAIN: 0.6
+          TEST: 0.1
+          ARCHIVE: 0.3
+      - task: train_a2c_level0
+        vars:
+          TRAIN: 0.6
+          TEST: 0.1
+          ARCHIVE: 0.3
+
+  train_meta_level0:
+    desc: Train PushWorld with Meta A2C (level0)
+    vars:
+      COMMAND: >-
+        poetry run python rl_for_dummies/pushworld/meta_a2c_pushworld_2.py
+        --n-train-processes 8
+        --num-policy-updates 1000000
+        --meta-episode-length 500
+        --meta-episodes-per-policy-update 32
+        --meta-episodes-batch-size 8
+        --opt-epochs 4
+        --train-percentage {{.TRAIN}}
+        --test-percentage {{.TEST}}
+        --archive-percentage {{.ARCHIVE}}
+        --checkpoint
+        --track
+    cmds:
+      - |
+        python -m scripts.submit_exp \
+        --docker-tag juggy69/rl-for-dummies:arm \
+        --archs "linux/arm64" \
+        --exp-script "meta-level0" \
+        --num-seed 3 \
+        --job-queue "c6g-16xlarge" \
+        --num-vcpu 8 \
+        --num-memory 60000 \
+        --provider aws \
+        --command "{{.COMMAND}}"
+
+  train_a2c_level0:
+    desc: Train PushWorld with A2C (level0)
+    vars:
+      COMMAND: >-
+        poetry run python rl_for_dummies/pushworld/a2c_recurrent_pushworld_parameterised.py
+        --n-train-processes 8
+        --update-interval 10
+        --max-train-steps 1000000
+        --train-percentage {{.TRAIN}}
+        --test-percentage {{.TEST}}
+        --archive-percentage {{.ARCHIVE}}
+        --track
+    cmds:
+      - |
+        python -m scripts.submit_exp \
+        --docker-tag juggy69/rl-for-dummies:arm \
+        --archs "linux/arm64" \
+        --exp-script "a2c-level0" \
+        --num-seed 3 \
+        --job-queue "c6g-16xlarge" \
+        --num-vcpu 8 \
+        --num-memory 60000 \
+        --provider aws \
+        --command "{{.COMMAND}}"
+
+  run-level0-no-test:
+    cmds:
+      - task: train_meta_level0_no_test
+        vars:
+          TRAIN: 0.2
+          TEST: 0
+          ARCHIVE: 0.8
+      # - task: train_meta_level0_no_test
+      #   vars:
+      #     TRAIN: 0.3
+      #     TEST: 0
+      #     ARCHIVE: 0.7
+      - task: train_meta_level0_no_test
+        vars:
+          TRAIN: 0.4
+          TEST: 0
+          ARCHIVE: 0.6
+      - task: train_a2c_level0_no_test
+        vars:
+          TRAIN: 0.2
+          TEST: 0
+          ARCHIVE: 0.8
+      # - task: train_a2c_level0_no_test
+      #   vars:
+      #     TRAIN: 0.3
+      #     TEST: 0
+      #     ARCHIVE: 0.7
+      - task: train_a2c_level0_no_test
+        vars:
+          TRAIN: 0.4
+          TEST: 0
+          ARCHIVE: 0.6
+
+  train_meta_level0_no_test:
+    desc: Train PushWorld with Meta A2C (level0)
+    vars:
+      COMMAND: >-
+        poetry run python rl_for_dummies/pushworld/meta_a2c_pushworld_2_no_test.py
+        --n-train-processes 4
+        --num-policy-updates 100000
+        --meta-episode-length 500
+        --meta-episodes-per-policy-update 8
+        --meta-episodes-batch-size 4
+        --opt-epochs 2
+        --train-percentage {{.TRAIN}}
+        --test-percentage {{.TEST}}
+        --archive-percentage {{.ARCHIVE}}
+        --checkpoint
+        --track
+    cmds:
+      - |
+        python -m scripts.submit_exp \
+        --docker-tag juggy69/rl-for-dummies:arm \
+        --archs "linux/arm64" \
+        --exp-script "meta-level0" \
+        --num-seed 3 \
+        --job-queue "c6g-16xlarge" \
+        --num-vcpu 8 \
+        --num-memory 40000 \
+        --provider aws \
+        --command "{{.COMMAND}}"
+
+  train_a2c_level0_no_test:
+    desc: Train PushWorld with A2C (level0)
+    vars:
+      COMMAND: >-
+        poetry run python rl_for_dummies/pushworld/a2c_recurrent_pushworld_parameterised_no_test.py
+        --n-train-processes 4
+        --update-interval 10
+        --max-train-steps 100000
+        --train-percentage {{.TRAIN}}
+        --test-percentage {{.TEST}}
+        --archive-percentage {{.ARCHIVE}}
+        --track
+    cmds:
+      - |
+        python -m scripts.submit_exp \
+        --docker-tag juggy69/rl-for-dummies:arm \
+        --archs "linux/arm64" \
+        --exp-script "a2c-level0" \
+        --num-seed 3 \
+        --job-queue "c6g-16xlarge" \
+        --num-vcpu 8 \
+        --num-memory 40000 \
+        --provider aws \
+        --command "{{.COMMAND}}"

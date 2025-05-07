@@ -1,80 +1,72 @@
-import contextlib
+import datetime
 import os
 import random
 import signal
 import sys
 from dataclasses import dataclass
+from typing import Optional
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import tyro
 from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper  # noqa
-from pushworld.config import BENCHMARK_PUZZLES_PATH
+from pushworld.data import level0  # noqa
+from pushworld.gym_env import PushWorldEnv
 from torch.distributions import Categorical
-from torch.profiler import record_function
-
-from envs.pushworld import PushWorldEnv
-
-# Hyperparameters
-n_train_processes = 8
-learning_rate = 0.0002
-gamma = 0.98
-entropy_coef = 0.1
-
-num_policy_updates = 5
-meta_episode_length = 500
-# The number below is number of steps per policy update.
-# meta_episodes_per_policy_update = 20000 // (n_train_processes * meta_episode_length)
-# 32 / 8 = 4
-meta_episodes_per_policy_update = 32
-# Per policy update, we have 32 meta episodes. Reshape so that when we train, batch size is 16.
-meta_episodes_batch_size = 16
-# This means for each optimization epoch, we will need 32 / 16 = 2 iterations to train on all the data.
-opt_epochs = 4
-
-PRINT_INTERVAL = 5
-SEED = 42
+from torch.utils.tensorboard.writer import SummaryWriter
 
 
-def plot_results():
-    # Create a figure with 2 subplots in 1 row
-    plt.figure(figsize=(12, 5))
+@dataclass
+class TrainingConfig:
+    """Configuration for Meta-A2C training on PushWorld environments"""
 
-    # First subplot (left side)
-    plt.subplot(1, 2, 1)  # 1 row, 2 columns, 1st position
-    plt.plot(policy_update_mean_rewards)
-    plt.title("Policy Update Mean Rewards")
-    plt.xlabel("Update")
-    plt.ylabel("Reward")
+    # Environment settings
+    max_steps: int = 50
 
-    # Second subplot (right side)
-    plt.subplot(1, 2, 2)  # 1 row, 2 columns, 2nd position
-    plt.plot(avg_scores)
-    plt.title("Test Mean Rewards")
-    plt.xlabel("Update")
-    plt.ylabel("Reward")
+    # Training hyperparameters
+    n_train_processes: int = 8
+    learning_rate: float = 0.0002
+    gamma: float = 0.98
+    entropy_coef: float = 0.1
 
-    # Add spacing between subplots
-    plt.tight_layout()
+    # Meta-learning settings
+    num_policy_updates: int = 2000
+    meta_episode_length: int = 500
+    meta_episodes_per_policy_update: int = 32
+    # Number of meta episode collection iterations is meta_episodes_per_policy_update / n_train_processes
 
-    plt.savefig("training_progress.png")
+    # This should be a factor of meta_episodes_per_policy_update because we are reshaping all meta_episodes
+    # into this batch size.
+    meta_episodes_batch_size: int = 8
+    # This means for each optimization epoch, we will need meta_episodes_per_policy_update / meta_episodes_batch_size
+    # iterations to train on all the data.
+    opt_epochs: int = 6
+
+    # Checkpointing
+    checkpoint: bool = False
+    checkpoint_frequency: int = 10
+    """how often to save model weights"""
+    resume_from_checkpoint: Optional[str] = None
+
+    # W&B
+    track: bool = False
+    """if toggled, this experiment will be tracked with Weights and Biases"""
+    wandb_project_name: str = "Meta-RL PushWorld"
+    """the wandb's project name"""
+    wandb_entity: Optional[str] = None
+    """the entity (team) of wandb's project"""
+
+    # Reproducibility
+    seed: int = 42
 
 
 def signal_handler(sig, frame):
     """Custom signal handler for graceful shutdown"""
     print("\nInterrupted by Ctrl+C. Cleaning up...")
-    # Attempt to close environments safely
-    if envs:
-        envs.close()
-
-    # Plot the results if we have any data
-    if policy_update_mean_rewards and avg_scores:
-        plot_results()
-
     print("Exiting gracefully...")
     sys.exit(0)  # Exit cleanly
 
@@ -82,10 +74,13 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 
-def make_env(render_mode=None, puzzle_dir="train"):
+def make_env(config, render_mode=None, puzzle_dir="train"):
     env = PushWorldEnv(
-        max_steps=50,
-        puzzle_path=os.path.join(BENCHMARK_PUZZLES_PATH, "level0", "mini", puzzle_dir),
+        max_steps=config.max_steps,
+        puzzle_path=os.path.join(
+            level0.__path__[0],
+            puzzle_dir,
+        ),
         render_mode=render_mode,
     )
     return env
@@ -102,12 +97,12 @@ class ActorCritic(nn.Module):
 
         # Fully connected layers
         self.fc1 = nn.Linear(conv_output_size, 64)
-        self.lstm_cell = nn.LSTMCell(294, 64)
-        self.fc_pi = nn.Linear(64, 4)  # 4 actions for PushWorld
-        self.fc_v = nn.Linear(64, 1)
+        self.lstm_cell = nn.LSTMCell(conv_output_size + 6, 256)
+        self.fc_pi = nn.Linear(256, 4)  # 4 actions for PushWorld
+        self.fc_v = nn.Linear(256, 1)
 
     def initial_state(self, batch_size):
-        return torch.zeros(batch_size, 2 * 64, dtype=torch.float)  # [B, 128]
+        return torch.zeros(batch_size, 2 * 256, dtype=torch.float)  # [B, 512]
 
     def forward(self, x, hidden, prev_action, prev_reward, prev_done):
         """Common forward pass for both policy and value networks"""
@@ -191,13 +186,13 @@ class ActorCritic(nn.Module):
             features_by_timestep.append(h_n)
             hidden = torch.cat((h_n, c_n), dim=1)
 
-        features = torch.stack(features_by_timestep, dim=1)  # [B, T, 64]
+        features = torch.stack(features_by_timestep, dim=1)  # [B, T, 256]
         if T == 1:
-            features = features.squeeze(1)  # [B, 64]
+            features = features.squeeze(1)  # [B, 256]
 
-        # If T == 1, features is [B, 64]
-        # Otherwise, features is [B, T, 64]
-        # hidden is just [B, 128]
+        # If T == 1, features is [B, 256]
+        # Otherwise, features is [B, T, 256]
+        # hidden is just [B, 512]
         return features, hidden
 
     def pi(self, x, hidden, prev_action, prev_reward, prev_done, softmax_dim=-1):
@@ -214,10 +209,10 @@ class ActorCritic(nn.Module):
         return v
 
 
-def worker(worker_id, master_end, worker_end):
+def worker(worker_id, master_end, worker_end, config):
     master_end.close()  # Forbid worker to use the master end for messaging
-    env = make_env()
-    env.action_space.seed(SEED + worker_id)
+    env = make_env(config)
+    env.action_space.seed(config.seed + worker_id)
 
     while True:
         cmd, data = worker_end.recv()
@@ -240,8 +235,8 @@ def worker(worker_id, master_end, worker_end):
 
 
 class ParallelEnv:
-    def __init__(self, n_train_processes):
-        self.nenvs = n_train_processes
+    def __init__(self, config):
+        self.nenvs = config.n_train_processes
         self.waiting = False
         self.closed = False
         self.workers = list()
@@ -252,7 +247,9 @@ class ParallelEnv:
         for worker_id, (master_end, worker_end) in enumerate(
             zip(master_ends, worker_ends)
         ):
-            p = mp.Process(target=worker, args=(worker_id, master_end, worker_end))
+            p = mp.Process(
+                target=worker, args=(worker_id, master_end, worker_end, config)
+            )
             p.daemon = True
             p.start()
             self.workers.append(p)
@@ -293,12 +290,13 @@ class ParallelEnv:
             self.closed = True
 
 
-def test(step_idx, model):
-    env = make_env(puzzle_dir="test")
-    env.action_space.seed(SEED)
+def test(step_idx, model, config):
+    env = make_env(config, puzzle_dir="test")
+    env.action_space.seed(config.seed)
     done = False
-    num_test = 100
+    num_test = 5
     test_scores = []
+    final_episode_scores = []
     for _ in range(num_test):
         s, _ = env.reset()
         initial_state = model.initial_state(1)
@@ -309,7 +307,9 @@ def test(step_idx, model):
         prev_done = torch.ones(1, dtype=torch.float)  # [1] (not done)
 
         score = 0.0
-        for t in range(meta_episode_length):
+        episode_score = 0.0
+        episode_scores = []
+        for t in range(config.meta_episode_length):
             # Convert observation to tensor and add batch dimension
             s_tensor = torch.from_numpy(s).float().unsqueeze(0)  # [1, H, W, C]
 
@@ -323,28 +323,39 @@ def test(step_idx, model):
 
             a = Categorical(prob).sample().item()
             s_prime, r, terminated, truncated, info = env.step(a)
+            score += r
+            episode_score += r
             done = terminated or truncated
             if done:
+                episode_scores.append(episode_score)
+                episode_score = 0.0
                 s_prime, _ = env.reset(options={"maintain_puzzle": True})
 
             s = s_prime
-            score += r
 
             # Update prev_* values for next step
             prev_action = torch.tensor([a], dtype=torch.long)
             prev_reward = torch.tensor([r], dtype=torch.float)
             prev_done = torch.tensor([0.0 if done else 1.0], dtype=torch.float)
 
+        if episode_scores:
+            final_episode_scores.append(episode_scores[-1])
+        else:
+            final_episode_scores.append(0.0)
+
         test_scores.append(score)
 
     avg_score = np.mean(test_scores)
-    print(f"Step # :{step_idx}, avg test score : {avg_score}")
+    avg_final_episode_score = np.mean(final_episode_scores)
+    print(
+        f"Step # :{step_idx}, avg test score : {avg_score}, avg final episode score : {avg_final_episode_score}"
+    )
 
     env.close()
-    return avg_score
+    return avg_score, avg_final_episode_score
 
 
-def compute_target(v_final, r_lst, mask_lst):
+def compute_target(v_final, r_lst, mask_lst, config):
     G = v_final.squeeze(-1)
     td_target = list()
 
@@ -353,11 +364,20 @@ def compute_target(v_final, r_lst, mask_lst):
     # so we do not utilize the usual 'done' masking in this function.
     for r, mask in zip(r_lst[::-1], mask_lst[::-1]):
         # G = r + gamma * G * mask
-        G = r + gamma * G
+        G = r + config.gamma * G
         td_target.append(G)
 
     # Reverse td_target list
     return torch.tensor(td_target[::-1]).float()
+
+
+def load_checkpoint(checkpoint_path, model, optimizer):
+    """Load model and optimizer state from checkpoint."""
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    start_update_idx = checkpoint["policy_update_idx"] + 1
+    return start_update_idx
 
 
 # Data class object to store a meta episode data
@@ -371,27 +391,31 @@ class MetaEpisodeData:
     adv_lst: np.ndarray
 
 
-policy_update_mean_rewards = []
-avg_scores = []
-envs = None
-
-
-def main():
-    # Seeding
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
-
-    envs = ParallelEnv(n_train_processes)
+def main(config: TrainingConfig, writer: SummaryWriter, envs: ParallelEnv):
     model = ActorCritic()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
+
+    if config.resume_from_checkpoint:
+        if config.track and config.resume_from_checkpoint.startswith("wandb:"):
+            # Not sure if this works
+            artifact_name = config.resume_from_checkpoint[6:]  # Remove "wandb:" prefix
+            artifact = wandb.use_artifact(artifact_name)
+            artifact_dir = artifact.download()
+            checkpoint_path = os.path.join(artifact_dir, os.listdir(artifact_dir)[0])
+        else:
+            checkpoint_path = config.resume_from_checkpoint
+
+        start_update_idx = load_checkpoint(checkpoint_path, model, optimizer)
+    else:
+        start_update_idx = 0
 
     # B is batch size, which in this case is n_train_processes
     # T is timesteps, which in this case is meta_episode_length
-    for policy_update_idx in range(num_policy_updates):
+    for policy_update_idx in range(start_update_idx, config.num_policy_updates):
         meta_episodes = []
-        for _ in range(meta_episodes_per_policy_update // n_train_processes):
+        for _ in range(
+            config.meta_episodes_per_policy_update // config.n_train_processes
+        ):
             s_lst, a_lst, r_lst, done_lst, v_lst = (
                 list(),
                 list(),
@@ -402,21 +426,21 @@ def main():
 
             # t means current timestep. tm1 is previous, tp1 is next.
             s_t = envs.reset()  # [B, 7, 7, 4]
-            a_tm1 = np.zeros((n_train_processes,))  # [B]
-            r_tm1 = np.zeros((n_train_processes,))  # [B]
-            done_tm1 = np.zeros((n_train_processes,))  # [B]
+            a_tm1 = np.zeros((config.n_train_processes,))  # [B]
+            r_tm1 = np.zeros((config.n_train_processes,))  # [B]
+            done_tm1 = np.zeros((config.n_train_processes,))  # [B]
 
             # Initial hidden state
-            hidden_tm1 = model.initial_state(n_train_processes)  # [B, 128]
+            hidden_tm1 = model.initial_state(config.n_train_processes)  # [B, 512]
 
-            for t in range(meta_episode_length):
+            for t in range(config.meta_episode_length):
                 prob_t, hidden_t = model.pi(
                     torch.from_numpy(s_t).float(),
                     hidden_tm1,
                     torch.from_numpy(a_tm1).long(),
                     torch.from_numpy(r_tm1).float(),
                     torch.from_numpy(done_tm1).float(),
-                )  # [B, 4], [B, 128]
+                )  # [B, 4], [B, 512]
 
                 v_t = model.v(
                     torch.from_numpy(s_t).float(),
@@ -456,7 +480,7 @@ def main():
                 .detach()
                 .numpy()
             )  # [B, 1]
-            td_target = compute_target(v_final, r_lst, done_lst)  # [T, B]
+            td_target = compute_target(v_final, r_lst, done_lst, config)  # [T, B]
 
             v_vec = torch.tensor(v_lst)  # [T, B]
             # Both td_target and v_vec here are tensors. But do we need them to be?
@@ -482,14 +506,16 @@ def main():
         # Log mean rewards per meta episode
         mean_rewards = [round(ep.r_lst.sum(axis=1).mean(), 2) for ep in meta_episodes]
         print(f"Step #{policy_update_idx}, mean reward mean: {np.mean(mean_rewards)}")
-        policy_update_mean_rewards.append(np.mean(mean_rewards))
+        writer.add_scalar(
+            "charts/mean_reward", np.mean(mean_rewards), policy_update_idx
+        )
 
         # I want to "flatten" the meta episodes. Right now each meta_episode contains a batch of size n_train_processes.
         # Instead I want each meta episode to just contain a single episode of batch size 1.
         # Then during training we will randomly sample a batch of size B from the meta episodes for each policy update.
         flattened_meta_episodes = []
         for meta_episode in meta_episodes:
-            for i in range(n_train_processes):
+            for i in range(config.n_train_processes):
                 flattened_meta_episodes.append(
                     MetaEpisodeData(
                         s_lst=meta_episode.s_lst[i],
@@ -502,139 +528,164 @@ def main():
                 )
         meta_episodes = flattened_meta_episodes
 
-        # with profile(
-        #     activities=[ProfilerActivity.CPU],
-        # ) as prof:
-        with contextlib.nullcontext() as prof:
-            for opt_epoch in range(opt_epochs):
-                with record_function("opt_epoch_loop"):
-                    idxs = np.random.permutation(meta_episodes_per_policy_update)
-                    total_loss = 0
-                    for i in range(
-                        0, meta_episodes_per_policy_update, meta_episodes_batch_size
-                    ):
-                        idx_batch = idxs[i : i + meta_episodes_batch_size]
-                        meta_episodes_batch = [meta_episodes[idx] for idx in idx_batch]
+        for opt_epoch in range(config.opt_epochs):
+            idxs = np.random.permutation(config.meta_episodes_per_policy_update)
+            total_loss = 0
+            for i in range(
+                0,
+                config.meta_episodes_per_policy_update,
+                config.meta_episodes_batch_size,
+            ):
+                idx_batch = idxs[i : i + config.meta_episodes_batch_size]
+                meta_episodes_batch = [meta_episodes[idx] for idx in idx_batch]
 
-                        with record_function("data_prep"):
-                            # Combine meta_episodes_batch into one MetaEpisodeData object that has a new batch dimension
-                            # of size meta_episodes_batch_size.
-                            meta_episode = MetaEpisodeData(
-                                s_lst=np.stack(
-                                    [ep.s_lst for ep in meta_episodes_batch]
-                                ),
-                                a_lst=np.stack(
-                                    [ep.a_lst for ep in meta_episodes_batch]
-                                ),
-                                r_lst=np.stack(
-                                    [ep.r_lst for ep in meta_episodes_batch]
-                                ),
-                                done_lst=np.stack(
-                                    [ep.done_lst for ep in meta_episodes_batch]
-                                ),
-                                v_lst=np.stack(
-                                    [ep.v_lst for ep in meta_episodes_batch]
-                                ),
-                                adv_lst=np.stack(
-                                    [ep.adv_lst for ep in meta_episodes_batch]
-                                ),
-                            )
+                # Combine meta_episodes_batch into one MetaEpisodeData object that has a new batch dimension
+                # of size meta_episodes_batch_size.
+                meta_episode = MetaEpisodeData(
+                    s_lst=np.stack([ep.s_lst for ep in meta_episodes_batch]),
+                    a_lst=np.stack([ep.a_lst for ep in meta_episodes_batch]),
+                    r_lst=np.stack([ep.r_lst for ep in meta_episodes_batch]),
+                    done_lst=np.stack([ep.done_lst for ep in meta_episodes_batch]),
+                    v_lst=np.stack([ep.v_lst for ep in meta_episodes_batch]),
+                    adv_lst=np.stack([ep.adv_lst for ep in meta_episodes_batch]),
+                )
 
-                            # Compute losses
-                            mb_s = torch.from_numpy(
-                                meta_episode.s_lst
-                            ).float()  # [B, T, 7, 7, 4]
-                            mb_a = torch.from_numpy(meta_episode.a_lst).long()  # [B, T]
-                            mb_r = torch.from_numpy(
-                                meta_episode.r_lst
-                            ).float()  # [B, T]
-                            mb_done = torch.from_numpy(
-                                meta_episode.done_lst
-                            ).float()  # [B, T]
-                            mb_v = torch.from_numpy(
-                                meta_episode.v_lst
-                            ).float()  # [B, T]
-                            mb_adv = torch.from_numpy(
-                                meta_episode.adv_lst
-                            ).float()  # [B, T]
+                # Compute losses
+                mb_s = torch.from_numpy(meta_episode.s_lst).float()  # [B, T, 7, 7, 4]
+                mb_a = torch.from_numpy(meta_episode.a_lst).long()  # [B, T]
+                mb_r = torch.from_numpy(meta_episode.r_lst).float()  # [B, T]
+                mb_done = torch.from_numpy(meta_episode.done_lst).float()  # [B, T]
+                mb_v = torch.from_numpy(meta_episode.v_lst).float()  # [B, T]
+                mb_adv = torch.from_numpy(meta_episode.adv_lst).float()  # [B, T]
 
-                            a_dummy = torch.zeros(
-                                (meta_episodes_batch_size, 1)
-                            ).long()  # [B, 1]
-                            r_dummy = torch.zeros(
-                                (meta_episodes_batch_size, 1)
-                            )  # [B, 1]
-                            done_dummy = torch.zeros(
-                                (meta_episodes_batch_size, 1)
-                            )  # [B, 1]
+                a_dummy = torch.zeros(
+                    (config.meta_episodes_batch_size, 1)
+                ).long()  # [B, 1]
+                r_dummy = torch.zeros((config.meta_episodes_batch_size, 1))  # [B, 1]
+                done_dummy = torch.zeros((config.meta_episodes_batch_size, 1))  # [B, 1]
 
-                            prev_action = torch.cat(
-                                (a_dummy, mb_a[:, :-1]), dim=1
-                            )  # [B, T]
-                            prev_reward = torch.cat(
-                                (r_dummy, mb_r[:, :-1]), dim=1
-                            )  # [B, T]
-                            prev_done = torch.cat(
-                                (done_dummy, mb_done[:, :-1]), dim=1
-                            )  # [B, T]
+                prev_action = torch.cat((a_dummy, mb_a[:, :-1]), dim=1)  # [B, T]
+                prev_reward = torch.cat((r_dummy, mb_r[:, :-1]), dim=1)  # [B, T]
+                prev_done = torch.cat((done_dummy, mb_done[:, :-1]), dim=1)  # [B, T]
 
-                            hidden = model.initial_state(
-                                meta_episodes_batch_size
-                            )  # [B, 128]
+                hidden = model.initial_state(
+                    config.meta_episodes_batch_size
+                )  # [B, 512]
 
-                        with record_function("pi"):
-                            prob, _ = model.pi(
-                                mb_s,
-                                hidden,
-                                prev_action,
-                                prev_reward,
-                                prev_done,
-                            )
+                prob, _ = model.pi(
+                    mb_s,
+                    hidden,
+                    prev_action,
+                    prev_reward,
+                    prev_done,
+                )
 
-                        with record_function("v"):
-                            v = model.v(
-                                mb_s,
-                                hidden,
-                                prev_action,
-                                prev_reward,
-                                prev_done,
-                            )
+                v = model.v(
+                    mb_s,
+                    hidden,
+                    prev_action,
+                    prev_reward,
+                    prev_done,
+                )
 
-                        with record_function("loss_computation"):
-                            entropy = Categorical(prob).entropy()
+                entropy = Categorical(prob).entropy()
 
-                            # Use prob to calculate log prob again using mb_a
-                            log_prob_a = torch.log(
-                                prob.gather(2, mb_a.unsqueeze(-1)).squeeze(-1)
-                            )
+                # Use prob to calculate log prob again using mb_a
+                log_prob_a = torch.log(prob.gather(2, mb_a.unsqueeze(-1)).squeeze(-1))
 
-                            policy_loss = -torch.mean(log_prob_a * mb_adv)
-                            value_loss = F.smooth_l1_loss(v.squeeze(-1), mb_v)
-                            entropy_loss = -torch.mean(entropy)
+                policy_loss = -torch.mean(log_prob_a * mb_adv)
+                value_loss = F.smooth_l1_loss(v.squeeze(-1), mb_v)
+                entropy_loss = -torch.mean(entropy)
 
-                            loss = (
-                                policy_loss - entropy_coef * entropy_loss + value_loss
-                            )
-                            total_loss += loss.item()
+                loss = policy_loss - config.entropy_coef * entropy_loss + value_loss
+                total_loss += loss.item()
 
-                    with record_function("optimizer_step"):
-                        optimizer.zero_grad()
-                        loss.backward()
-                        optimizer.step()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
         # Print the profiler output (sorted by total CPU time)
         # print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=20))
         # prof.export_chrome_trace("trace.json")
 
-        # if policy_update_idx % PRINT_INTERVAL == 0:
-        avg_score = test(policy_update_idx, model)
-        avg_scores.append(avg_score)
+        avg_score, avg_final_episode_score = test(policy_update_idx, model, config)
+        writer.add_scalar("charts/test_mean_reward", avg_score, policy_update_idx)
+        writer.add_scalar(
+            "charts/test_mean_episode_return",
+            avg_final_episode_score,
+            policy_update_idx,
+        )
+
+        if config.checkpoint and policy_update_idx % config.checkpoint_frequency == 0:
+            checkpoint_dir = f"checkpoints/{run_name}"
+            os.makedirs(checkpoint_dir, exist_ok=True)
+
+            checkpoint_path = f"{checkpoint_dir}/checkpoint_{policy_update_idx}.pt"
+            torch.save(
+                {
+                    "policy_update_idx": policy_update_idx,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                },
+                checkpoint_path,
+            )
+
+            if config.track:
+                # Log as W&B Artifact
+                artifact = wandb.Artifact(f"model-{run_name}", type="model")
+                artifact.add_file(checkpoint_path)
+                wandb.log_artifact(artifact)
 
 
 if __name__ == "__main__":
+    # Parse command line arguments using tyro
+    config = tyro.cli(TrainingConfig)
+
+    # Some assertions on the relationship between config parameters
+    assert (
+        config.meta_episodes_per_policy_update % config.n_train_processes == 0
+    ), "num_processes must be a factor of meta_episodes_per_policy_update"
+    # meta_episodes_batch_size has to be a factor of meta_episodes_per_policy_update
+    assert (
+        config.meta_episodes_per_policy_update % config.meta_episodes_batch_size == 0
+    ), "meta_episodes_batch_size must be a factor of meta_episodes_per_policy_update"
+
+    run_name = f"meta_a2c_level0__{config.seed}__{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    if config.track:
+        import wandb
+
+        wandb.init(
+            project=config.wandb_project_name,
+            entity=config.wandb_entity,
+            sync_tensorboard=True,
+            config=vars(config),
+            name=run_name,
+            monitor_gym=True,
+            save_code=True,
+        )
+    writer = SummaryWriter(f"runs/{run_name}")
+    writer.add_text(
+        "hyperparameters",
+        "|param|value|\n|-|-|\n%s"
+        % ("\n".join([f"|{key}|{value}|" for key, value in vars(config).items()])),
+    )
+
+    # Seeding
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    torch.cuda.manual_seed_all(config.seed)
+
+    # Shuffle our Braindead puzzles based on config
+    # No shuffling for now
+
     try:
-        main()
+        envs = ParallelEnv(config)
+        main(config, writer, envs)
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user. Cleaning up...")
     finally:
-        if envs:
-            envs.close()
-        plot_results()
+        writer.close()
+        envs.close()
+        if config.track:
+            wandb.finish()
